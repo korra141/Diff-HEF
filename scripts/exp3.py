@@ -9,7 +9,7 @@ the measurements are coming from. This is expected to increase the variance of t
 scenario lead to multiple modes in the learned distribution.
 
 
-Same as Experiment 1 but with Heteroscedastic noise.
+Same as Experiment 2 but with multimodal noise.
 """
 
 
@@ -42,8 +42,10 @@ def parse_args():
     parser.add_argument('--measurement_noise_max', type=float, default=0.3, help='Standard deviation of the measurement noise')
     parser.add_argument('--step_size', type=float, default=0.1, help='Step between poses in trajectory')
     parser.add_argument('--shuffle_flag', type=bool, default=True, help='Whether to shuffle the samples')
-    parser.add_argument("--log-dir", type=str, default="./logs/exp2/", help="Directory to save the logs")    
+    parser.add_argument("--log-dir", type=str, default="./logs/exp3/", help="Directory to save the logs")    
     parser.add_argument("--log-freq", type=int, default=10, help="Frequency of logging the results")
+    parser.add_argument("--mean_offset", type=float, default=0.2, help="Mean offset for the multimodal noise")
+    parser.add_argument("--bin_prob", type=float, default=0.5, help="Probability of selecting the first mode")  
     return parser.parse_args()  
 
 args = parse_args()
@@ -54,6 +56,32 @@ def heteroscedastic_noise(x, min_noise, max_noise):
    x = x / (2 * np.pi)
    scale = x**2 / (x**2 + (1-x)**2)
    return min_noise + scale * (max_noise - min_noise)
+
+
+def multimodal_gaussian_noise(args, x):
+  variance1 = heteroscedastic_noise(x, args.measurement_noise_min, args.measurement_noise_max)
+  variance2 = heteroscedastic_noise(x, args.measurement_noise_min, args.measurement_noise_max)
+  mean1 = -args.mean_offset / 2
+  mean2 = +args.mean_offset / 2
+  noise1 = np.random.normal(mean1, 0.1, 1)
+  noise2 = np.random.normal(mean2, 0.1, 1)
+  mask = np.random.binomial(1, args.bin_prob, 1)
+
+  return mask * noise1 + (1 - mask) * noise2
+
+
+def normal_density(x, mean=0, std=1):
+    return (1 / (np.sqrt(2 * np.pi * std**2))) * np.exp(-((x - mean)**2) / (2 * std**2))
+
+
+def energy_multimodal_gaussian(args, x):
+   x = x.numpy()
+   grid = np.linspace(0, 2 * np.pi, args.band_limit, endpoint=False)
+   density1 = normal_density(grid, (x-args.mean_offset / 2) % 2*np.pi, args.measurement_noise_min)
+   density2 = normal_density(grid, (x+args.mean_offset / 2) % 2*np.pi, args.measurement_noise_min)
+   energy = np.log(args.bin_prob*density1 + (1-args.bin_prob)*density2)
+   return torch.from_numpy(energy).type(torch.FloatTensor)
+  
 
 
 def generating_data_S1(args, batch_size, n_samples, trajectory_length, measurement_noise, step=0.1, shuffle_flag=True):
@@ -82,7 +110,8 @@ def generating_data_S1(args, batch_size, n_samples, trajectory_length, measureme
     true_trajectories[i] = trajectory
 
     # Add Gaussian noise to the measurements.
-    noise = [np.random.normal(0, heteroscedastic_noise(x, args.measurement_noise_min, args.measurement_noise_max)) for x in trajectory]
+    noise = np.squeeze(np.array([multimodal_gaussian_noise(args, x) for x in trajectory]))
+    
     measurements[i] = (trajectory + noise) % (2 * np.pi)
 
   measurements_ = torch.from_numpy(measurements % (2 * np.pi))
@@ -211,6 +240,8 @@ def plot_circular_distribution(energy_samples,legend="predicted",ax=None):
     ax.text(0, -1.12, r'$-\frac{\pi}{2}$', style='italic', fontsize=20)
     return ax
 
+
+
 def plotting_von_mises(mu,cov,grid_size,ax,legend):
 
     # pdb.set_trace()
@@ -285,7 +316,7 @@ def main(args):
             if i % 50 == 0 and epoch % args.log_freq == 0:
                 fig, ax = plt.subplots()
                 ax = plot_circular_distribution(energy[0],"predicted distribution",ax)
-                ax = plotting_von_mises(ground_truth[0],heteroscedastic_noise(ground_truth[0], args.measurement_noise_min, args.measurement_noise_max).item()**2, args.band_limit,ax,"true distribution")
+                ax = plot_circular_distribution(energy_multimodal_gaussian(args, ground_truth[0]),"true distribution",ax)
                 ax.plot(torch.cos(measurements[0]),torch.sin(measurements[0]),'o',label="measurement data")
                 ax.plot(torch.cos(ground_truth[0]), torch.sin(ground_truth[0]), 'o', label="pose data")
                 ax.set_title(f"Epoch {epoch,}", loc='center')

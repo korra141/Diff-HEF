@@ -39,12 +39,12 @@ def parse_args():
     parser.add_argument('--n_samples', type=int, default=1000, help='Number of samples')
     parser.add_argument('--trajectory_length', type=int, default=100, help='Length of each trajectory')
     parser.add_argument('--measurement_noise_min', type=float, default=0.1, help='Standard deviation of the measurement noise')
-    parser.add_argument('--measurement_noise_max', type=float, default=0.3, help='Standard deviation of the measurement noise')
+    parser.add_argument('--measurement_noise_max', type=float, default=0.1, help='Standard deviation of the measurement noise')
     parser.add_argument('--step_size', type=float, default=0.1, help='Step between poses in trajectory')
     parser.add_argument('--shuffle_flag', type=bool, default=True, help='Whether to shuffle the samples')
     parser.add_argument("--log-dir", type=str, default="./logs/exp3/", help="Directory to save the logs")    
     parser.add_argument("--log-freq", type=int, default=10, help="Frequency of logging the results")
-    parser.add_argument("--mean_offset", type=float, default=0.2, help="Mean offset for the multimodal noise")
+    parser.add_argument("--mean_offset", type=float, default=np.pi/2, help="Mean offset for the multimodal noise")
     parser.add_argument("--bin_prob", type=float, default=0.5, help="Probability of selecting the first mode")  
     return parser.parse_args()  
 
@@ -59,26 +59,34 @@ def heteroscedastic_noise(x, min_noise, max_noise):
 
 
 def multimodal_gaussian_noise(args, x):
-  variance1 = heteroscedastic_noise(x, args.measurement_noise_min, args.measurement_noise_max)
-  variance2 = heteroscedastic_noise(x, args.measurement_noise_min, args.measurement_noise_max)
+  # variance1 = heteroscedastic_noise(x, args.measurement_noise_min, args.measurement_noise_max)
+  # variance2 = heteroscedastic_noise(x, args.measurement_noise_min, args.measurement_noise_max)
+  n_samples = x.shape[0]
+  std1 = args.measurement_noise_min
+  std2 = args.measurement_noise_max
   mean1 = -args.mean_offset / 2
   mean2 = +args.mean_offset / 2
-  noise1 = np.random.normal(mean1, 0.1, 1)
-  noise2 = np.random.normal(mean2, 0.1, 1)
-  mask = np.random.binomial(1, args.bin_prob, 1)
+  noise1 = np.random.normal(mean1, std1, n_samples)
+  noise2 = np.random.normal(mean2, std2, n_samples)
+  mask = np.random.binomial(1, args.bin_prob,  n_samples)
 
   return mask * noise1 + (1 - mask) * noise2
 
+def von_mises_density(x, mu, std):
+  kappa = 1/(std **2)
+  return np.exp(kappa * np.cos(x - mu)) / (2 * np.pi * i0(kappa))
 
-def normal_density(x, mean=0, std=1):
-    return (1 / (np.sqrt(2 * np.pi * std**2))) * np.exp(-((x - mean)**2) / (2 * std**2))
+def positive_angle(angle):
+    return (angle + 2 * np.pi) % (2 * np.pi)
+# def normal_density(x, mean=0, std=1):
+#     return (1 / (np.sqrt(2 * np.pi * std**2))) * np.exp(-((x - mean)**2) / (2 * std**2))
 
 
 def energy_multimodal_gaussian(args, x):
    x = x.numpy()
    grid = np.linspace(0, 2 * np.pi, args.band_limit, endpoint=False)
-   density1 = normal_density(grid, (x-args.mean_offset / 2) % 2*np.pi, args.measurement_noise_min)
-   density2 = normal_density(grid, (x+args.mean_offset / 2) % 2*np.pi, args.measurement_noise_min)
+   density1 = von_mises_density(grid,  positive_angle(x-args.mean_offset / 2) , args.measurement_noise_min)
+   density2 = von_mises_density(grid,  positive_angle(x+args.mean_offset / 2) , args.measurement_noise_max)
    energy = np.log(args.bin_prob*density1 + (1-args.bin_prob)*density2)
    return torch.from_numpy(energy).type(torch.FloatTensor)
   
@@ -107,57 +115,20 @@ def generating_data_S1(args, batch_size, n_samples, trajectory_length, measureme
     # Generate a circular trajectory with a random starting position.
     initial_angle = starting_positions[i]
     trajectory = initial_angle + np.arange(trajectory_length) * step
-    true_trajectories[i] = trajectory
+    true_trajectories[i] = trajectory % (2 * np.pi)
 
     # Add Gaussian noise to the measurements.
-    noise = np.squeeze(np.array([multimodal_gaussian_noise(args, x) for x in trajectory]))
+    noise = multimodal_gaussian_noise(args, trajectory)
     
     measurements[i] = (trajectory + noise) % (2 * np.pi)
 
-  measurements_ = torch.from_numpy(measurements % (2 * np.pi))
-  ground_truth_ = torch.from_numpy(true_trajectories % (2 * np.pi))
+  measurements_ = torch.from_numpy(measurements)
+  ground_truth_ = torch.from_numpy(true_trajectories)
   ground_truth_flatten = torch.flatten(ground_truth_)[:, None].type(torch.FloatTensor)
   measurements_flatten = torch.flatten(measurements_)[:, None].type(torch.FloatTensor)
   train_dataset = torch.utils.data.TensorDataset(ground_truth_flatten, measurements_flatten)
   train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle_flag)
   return train_loader
-
-
-def compute_coefficients(energy):
-  eta = torch.fft.fft(energy)
-  eta = torch.fft.fftshift(eta)
-  return eta
-
-
-def compute_normalization_constant(energy, band_limit):
-  # print(energy.size())
-  max_energy, _ = torch.max(energy, axis=1)
-  # print(max_energy)
-  moment = torch.fft.fft(torch.exp(energy - max_energy.unsqueeze(-1))) # Taking the FFT of the energy
-
-  lnZ = torch.abs(torch.log(moment[:, 0] / (torch.pi ** 2 * band_limit / 62)) + max_energy) # log of the normalization constant
-  return lnZ
-
-def negative_loglikelihood(energy, measurement, band_limit):
-  eta = compute_coefficients(energy)
-  freq = torch.range(0, band_limit-1)
-  # shifting the freq
-  freq = freq - math.floor(band_limit/2)
-
-  # Calculating the unnormalized likelihood
-  # exponent = 1j * (torch.dot(measurement.reshape(-1, 1), freq.unsqueeze(0)))
-  exponent = 1j * (freq.unsqueeze(0) * measurement.reshape(-1, 1))
-
-  loglikelihood = torch.sum(eta * torch.exp(exponent), axis=-1) / band_limit
-
-  # Normalizing the likelihood
-  lnZ = compute_normalization_constant(energy, band_limit)
-  loglikelihood = (loglikelihood - lnZ)
-  # print(torch.mean(lnZ))
-
-  return - torch.abs(torch.sum(loglikelihood)/energy.size(0))
-
-
 
 def loss_fn(energy, measurements, grid_size=20):
   """Computes the loss function for the circular motion model.
@@ -197,7 +168,7 @@ def plot_circular_distribution(energy_samples,legend="predicted",ax=None):
     grid_size = energy_samples.shape[0]
     maximum = torch.max(energy_samples).unsqueeze(-1)
     moments = torch.fft.fft(torch.exp(energy_samples - maximum), dim=-1)
-    ln_z_ = torch.log(moments[0] / (math.pi * grid_size * math.pi / 62)).real.unsqueeze(-1) + maximum
+    ln_z_ = torch.log(2*math.pi* moments[0]/grid_size).real.unsqueeze(-1) + maximum
     prob = torch.exp(energy_samples - ln_z_)
     prob = prob.detach()
 

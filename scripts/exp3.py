@@ -86,7 +86,7 @@ def energy_multimodal_gaussian(args, x):
    x = x.numpy()
    grid = np.linspace(0, 2 * np.pi, args.band_limit, endpoint=False)
    density1 = von_mises_density(grid,  positive_angle(x-args.mean_offset / 2) , args.measurement_noise_min)
-   density2 = von_mises_density(grid,  positive_angle(x+args.mean_offset / 2) , args.measurement_noise_min)
+   density2 = von_mises_density(grid,  positive_angle(x+args.mean_offset / 2) , args.measurement_noise_max)
    energy = np.log(args.bin_prob*density1 + (1-args.bin_prob)*density2)
    return torch.from_numpy(energy).type(torch.FloatTensor)
   

@@ -1,12 +1,10 @@
 #!/bin/bash
-#SBATCH --gres=gpu:4
-#SBATCH --cpus-per-task=4
-#SBATCH --ntasks-per-node=1
-#SBATCH --mem=64G
-#SBATCH --time=3:00:00
-#SBATCH --partition=short-unkillable          # Partition name
-#SBATCH --output=multi_gpu_%j.out     # Standard output and error log
-#SBATCH --error=multi_gpu_%j.err      # Error log
+#SBATCH --job-name=CNN_UE_R2
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=5G
+#SBATCH --partition=long-cpu         # Partition name
+#SBATCH --output=slurm_logs/multi_gpu_%j.out     # Standard output and error log
+#SBATCH --error=slurm_logs/multi_gpu_%j.err      # Error log
 
 
 
@@ -31,5 +29,5 @@ unset CUDA_VISIBLE_DEVICES
 
 # Execute Python script
 
-wandb agent korra141/Diff-HEF/oh7y26ru
-python mlp_measurement_model_with_analytical_hef_pm_on_s1.py
+wandb agent korra141/Diff-HEF/58woufk7
+#python cnn_uncertainity_estimation_in_r2.py

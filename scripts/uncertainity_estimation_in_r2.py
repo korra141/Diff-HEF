@@ -13,206 +13,683 @@ import matplotlib.pyplot as plt
 import math
 import numpy as np
 
-def generating_data_R2(n_samples, trajectory_length, measurement_noise, step_t,range_x,range_y):
+def generating_data_R2(n_samples, trajectory_length, measurement_noise, step_t):
+  min_x = -0.5
+  max_x = 0.5
+  interval_length_x = max_x - min_x
+  min_y = -0.5
+  max_y = 0.5
+  interval_length_y = max_y - min_y
 
-  interval_length_x = range_x[1] - range_x[0]
-  interval_length_y = range_y[1]- range_y[0]
-
+  # TODO: define the grid space for the trajectory
 
   # uniformly sampling the starting position
-  starting_position_x = np.linspace(range_x[0],range_x[1], n_samples)
-  starting_position_y = np.linspace(range_y[0],range_y[1], n_samples)
-
+  starting_position_x = np.linspace(min_x,max_x, n_samples)
+  starting_position_y = np.linspace(min_y,max_y, n_samples)
   true_trajectories = np.ndarray((n_samples, trajectory_length,2))
   measurements = np.ndarray((n_samples, trajectory_length,2))
 
   for i in range(n_samples):
     position = np.array([starting_position_x[i],starting_position_y[i]])
     for j in range(trajectory_length):
-      position[0] = range_x[0] + (position[0] - range_x[0]) % interval_length_x
-      position[1] = range_y[0] + (position[1] - range_y[0]) % interval_length_y
+      position[0] = min_x + (position[0] - min_x) % interval_length_x
+      position[1] = min_y + (position[1] - min_y) % interval_length_y
       true_trajectories[i,j] = position
       temp_measurements = position + np.random.multivariate_normal([0,0],np.eye(2)*(measurement_noise**2),1)[0]
-      # Make sure the measurements lie in the range as well on the grid.
-      temp_measurements[0] = (range_x[0] + (temp_measurements[0] - range_x[0]) % interval_length_x)//step_t[0] * step_t[0]
-      temp_measurements[1] = (range_y[0]+ (temp_measurements[1] - range_y[0]) % interval_length_y)//step_t[1] * step_t[1]
+      temp_measurements[0] = min_x + (temp_measurements[0] - min_x) % interval_length_x
+      temp_measurements[1] = min_y + (temp_measurements[1] - min_y) % interval_length_y
       measurements[i,j] = temp_measurements
       position = position + step_t
 
   return true_trajectories, measurements
 
-idx = torch.tensor([1,2,3])
-idy = torch.tensor([1,2,3])
+import torch
+import math
 
-energy = torch.rand((3,4,4))
+def multivariate_normal_density_batch_at_value(value, mean, covariance):
+    """
+    Compute the log probability density of a multivariate normal distribution for multiple points.
 
-energy[torch.arange(3), idx, idy]
+    Args:
+    - x: Tensor of shape [batch_size, d], the points at which to evaluate the PDF.
+    - mean: Tensor of shape [d], the mean vector of the distribution.
+    - covariance: Tensor of shape [d, d], the covariance matrix of the distribution.
 
-energy[1,2,2]
+    Returns:
+    - A tensor of shape [batch_size], representing the log probability densities for each point in x.
+    """
+    number_samples, d = mean.shape
+
+    # Compute the inverse and determinant of the covariance matrix
+    covariance_inv = torch.inverse(covariance)
+    covariance_det = torch.det(covariance)
+
+    # Compute the difference vector (x - mean)
+    diff = value - mean.unsqueeze(1).unsqueeze(1)  # Shape [n_samples,grid_1,grid2, 2]
+
+    # Compute the quadratic term: (x - mean)^T * inv(covariance) * (x - mean)
+    quadratic_term = torch.einsum('baci,ij,bacj->bac', diff, covariance_inv, diff)  # Shape [batch_size]
+
+    normalization_factor = ((2 * math.pi) ** (d / 2)) * torch.sqrt(covariance_det)
+
+    # Compute the PDF for each point in the batch and take log for numerical stability
+    log_pdf = -0.5 * quadratic_term
+    # - torch.log(normalization_factor)
+
+    return log_pdf #[n_samples,grid_1,grid_2]
+
+import torch
+import math
+
+def multivariate_normal_density_batch(mean, covariance):
+    """
+    Compute the log probability density of a multivariate normal distribution for multiple points.
+
+    Args:
+    - x: Tensor of shape [batch_size, d], the points at which to evaluate the PDF.
+    - mean: Tensor of shape [d], the mean vector of the distribution.
+    - covariance: Tensor of shape [d, d], the covariance matrix of the distribution.
+
+    Returns:
+    - A tensor of shape [batch_size], representing the log probability densities for each point in x.
+    """
+    number_samples, d = mean.shape
+    x = torch.linspace(-0.5, 0.5, band_limit[0])
+    y = torch.linspace(-0.5, 0.5, band_limit[1])
+    x, y = torch.meshgrid(x, y)
+    x = torch.tile(x.unsqueeze(0),(number_samples,1,1))  # Add batch dimension
+    y = torch.tile(y.unsqueeze(0),(number_samples,1,1))
+
+    samples = torch.stack([x,y],dim=-1)
+
+    # Compute the inverse and determinant of the covariance matrix
+    covariance_inv = torch.inverse(covariance)
+    covariance_det = torch.det(covariance)
+
+    # Compute the difference vector (x - mean)
+    diff = samples - mean.unsqueeze(1).unsqueeze(1)  # Shape [n_samples,grid_1,grid2, 2]
+
+    # Compute the quadratic term: (x - mean)^T * inv(covariance) * (x - mean)
+    quadratic_term = torch.einsum('baci,ij,bacj->bac', diff, covariance_inv, diff)  # Shape [batch_size]
+
+    normalization_factor = ((2 * math.pi) ** (d / 2)) * torch.sqrt(covariance_det)
+
+    # Compute the PDF for each point in the batch and take log for numerical stability
+    log_pdf = -0.5 * quadratic_term
+    #  - torch.log(normalization_factor)
+
+    return log_pdf #[n_samples,grid_1,grid_2]
+
+# @title
+import torch
+import matplotlib.pyplot as plt
+import cmath
+
+def generate_grid_samples(m, n, func):
+    """
+    Generates samples of a function on a 2D grid.
+
+    Args:
+    - m: Number of rows in the grid.
+    - n: Number of columns in the grid.
+    - func: A function that takes (x, y) coordinates and returns a value.
+
+    Returns:
+    - A 2D tensor of shape (m, n) with sampled values.
+    """
+    x = torch.Tensor(-1 + np.array(list(range(m)))*0.04)
+    y = torch.Tensor(-1 + np.array(list(range(n)))*0.04)
+    grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
+    samples = func(grid_x, grid_y)
+    return samples
+
+def efficient_manual_ifft2(freq_data):
+    """
+    Efficiently compute the 2D Inverse FFT using PyTorch tensor operations.
+
+    Args:
+    - freq_data: A 2D tensor in the frequency domain (complex values).
+
+    Returns:
+    - A 2D tensor in the spatial domain.
+    """
+    M, N = freq_data.shape
+
+    # Create a grid of coordinates
+    x = torch.arange(M)
+    y = torch.arange(N)
+    u = torch.arange(M)
+    v = torch.arange(N)
+
+    # Compute the outer product to get the coordinates
+    X, U = torch.meshgrid(x, u, indexing='ij')
+    Y, V = torch.meshgrid(y, v, indexing='ij')
+
+    # Compute the exponential term: e^(2j * pi * (ux/M + vy/N))
+    exp_x = torch.exp(2j * cmath.pi * X * U / M)
+    exp_y = torch.exp(2j * cmath.pi * Y * V / N)
+
+    # Compute the IFFT using matrix multiplications and broadcasting
+    # First along the columns (axis 0), then along the rows (axis 1)
+    temp = torch.matmul(exp_x, freq_data)
+    reconstructed = torch.matmul(temp, exp_y) / (M * N)
+
+    return reconstructed
+
+def efficient_manual_ifft2_value(freq_data,id_x,id_y):
+    """
+    Efficiently compute the 2D Inverse FFT using PyTorch tensor operations.
+
+    Args:
+    - freq_data: A 2D tensor in the frequency domain (complex values).
+
+    Returns:
+    - A 2D tensor in the spatial domain.
+    """
+    M, N = freq_data.shape
+
+    # Create a grid of coordinates
+    # x = torch.arange(M)
+    # y = torch.arange(N)
+    u = torch.arange(M)
+    v = torch.arange(N)
+
+    # Compute the outer product to get the coordinates
+    # X, U = torch.meshgrid(x, u, indexing='ij')
+    # Y, V = torch.meshgrid(y, v, indexing='ij')
+    temp_x = id_x * u.unsqueeze(0) #[1,M]
+    temp_y = id_y * v.unsqueeze(0) #[1,N]
+
+    # Compute the exponential term: e^(2j * pi * (ux/M + vy/N))
+    exp_x = torch.exp(2j * cmath.pi * temp_x / M)
+    exp_y = torch.exp(2j * cmath.pi * temp_y / N)
+
+    # Compute the IFFT using matrix multiplications and broadcasting
+    # First along the columns (axis 0), then along the rows (axis 1)
+    temp = torch.matmul(exp_x, freq_data) #[1,N]
+    reconstructed = torch.matmul(temp, exp_y.T) / (M * N)
+
+    return reconstructed
+
+# Define a function to sample on the grid (e.g., a Gaussian function)
+def sample_function(x, y):
+    """A simple Gaussian function."""
+    return torch.exp(-5 * torch.tensor((x**2 + y**2)))
+
+# Generate samples on a 2D grid
+grid_samples = generate_grid_samples(50, 50, sample_function)
+
+# Perform 2D FFT using PyTorch's built-in function
+freq_data = torch.fft.fft2(grid_samples)
+
+# Perform efficient manual 2D IFFT
+reconstructed_samples = efficient_manual_ifft2(freq_data).real
+
+
+
+id_x = 25
+id_y = 25
+recontructed_value = efficient_manual_ifft2_value(freq_data,id_x,id_y)
+value_x = -1 + (id_x) * 0.04
+value_y = -1 + (id_y) * 0.04
+function_value = sample_function(value_x,value_y)
+
+print("Error in the reconstruction function value %.3f"%(float(torch.mean(reconstructed_samples[id_x][id_y] - function_value))))
+print("Error in the reconstruction function value %.3f"%(float(torch.mean(recontructed_value.real - function_value))))
+
+print("Max Error in the recontructed signal", torch.max(torch.abs(reconstructed_samples - grid_samples)))
+
+# Plotting the original and reconstructed samples
+fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+axs[0].imshow(grid_samples, cmap='viridis')
+axs[0].set_title("Original Samples")
+axs[0].axis('off')
+
+axs[1].imshow(reconstructed_samples, cmap='viridis')
+axs[1].set_title("Reconstructed Samples (Efficient Manual IFFT)")
+axs[1].axis('off')
+plt.colorbar(axs[1].imshow(reconstructed_samples, cmap='viridis'))
+plt.show()
+
+# @title
+import torch
+import matplotlib.pyplot as plt
+import cmath
+
+def generate_grid_samples(m, n, func):
+    """
+    Generates samples of a function on a 2D grid.
+
+    Args:
+    - m: Number of rows in the grid.
+    - n: Number of columns in the grid.
+    - func: A function that takes (x, y) coordinates and returns a value.
+
+    Returns:
+    - A 2D tensor of shape (m, n) with sampled values.
+    """
+    x = torch.linspace(-1, 1, m)
+    y = torch.linspace(-1, 1, n)
+    grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
+    samples = func(grid_x, grid_y)
+    return samples
+
+def manual_ifft2(freq_data):
+    """
+    Manually compute the 2D Inverse FFT.
+
+    Args:
+    - freq_data: A 2D tensor in the frequency domain (complex values).
+
+    Returns:
+    - A 2D tensor in the spatial domain.
+    """
+    M, N = freq_data.shape
+    time_data = torch.zeros((M, N), dtype=torch.cfloat)
+
+    # Iterate over each point in the spatial domain
+    for x in range(M):
+        for y in range(N):
+            sum_val = 0
+            # Sum over all frequency components
+            for u in range(M):
+                for v in range(N):
+                    angle = torch.tensor(2j * cmath.pi * (u * x / M + v * y / N))
+                    sum_val += freq_data[u, v] * torch.exp(angle)
+            # Normalize by the total number of points
+            time_data[x, y] = sum_val / (M * N)
+
+    return time_data
+
+def manual_ifft2_query(freq_data,x_idx,y_idx):
+    """
+    Manually compute the 2D Inverse FFT.
+
+    Args:
+    - freq_data: A 2D tensor in the frequency domain (complex values).
+
+    Returns:
+    - A 2D tensor in the spatial domain.
+    """
+    M, N = freq_data.shape
+    # time_data = torch.zeros((M, N), dtype=torch.cfloat)
+    time_data = torch.tensor(0)
+
+    # Iterate over each point in the spatial domain
+    # for x in range(M):
+    #     for y in range(N):
+    sum_val = 0
+    # Sum over all frequency components
+    for u in range(M):
+        for v in range(N):
+            angle = torch.tensor(2j * cmath.pi * (u * x_idx / M + v * y_idx / N))
+            sum_val += freq_data[u, v] * torch.exp(angle)
+    # Normalize by the total number of points
+    time_data = sum_val / (M * N)
+
+    return time_data
+# Define a function to sample on the grid (e.g., a Gaussian function)
+def sample_function(x, y):
+    """A simple Gaussian function."""
+    return torch.exp(-5 * (x**2 + y**2))
+
+# Generate samples on a 2D grid
+grid_samples = generate_grid_samples(50, 50, sample_function)
+
+# Perform 2D FFT using PyTorch's built-in function
+freq_data = torch.fft.fft2(grid_samples)
+
+value = torch.tensor((0.4,0.2))
+idx_grid_x = int(1.4/0.04)-1
+idx_grid_y = int(1.2/0.04)-1
+print(idx_grid_x)
+print(idx_grid_y)
+
+sample_function_value = sample_function(value[0],value[1])
+reconstructed_function_value = manual_ifft2_query(freq_data,idx_grid_x,idx_grid_y)
+
+print("Error in the reconstruction function value",torch.mean(reconstructed_function_value.real - sample_function_value))
+
+# Perform manual 2D IFFT
+reconstructed_samples_manual = manual_ifft2(freq_data).real
+
+print("Error in the reconstruction function value through grid",torch.mean(reconstructed_samples_manual[idx_grid_x][idx_grid_y] - sample_function_value))
+
+print("Error in recontruction",torch.mean(reconstructed_samples_manual - grid_samples))
+
+# Plotting the original and reconstructed samples
+fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+axs[0].imshow(grid_samples, cmap='viridis')
+axs[0].set_title("Original Samples")
+axs[0].axis('off')
+
+axs[1].imshow(reconstructed_samples_manual, cmap='viridis')
+axs[1].set_title("Reconstructed Samples (Manual IFFT)")
+axs[1].axis('off')
+plt. colorbar(axs[1].imshow(reconstructed_samples_manual, cmap='viridis'))
+plt.show()
+
+# @title
+# import torch
+# import cmath
+
+# def manual_ifft2(freq_data):
+#     M, N = freq_data.shape
+#     time_data = torch.zeros((M, N), dtype=torch.cfloat)
+#     x = torch.linspace(-0.5,0.5,M)
+#     y = torch.linspace(-0.5,0.5,N)
+#     x,y = torch.meshgrid(x,y)
+
+#     for m in range(M):
+#         for n in range(N):
+#             sum_val = 0
+#             for k in range(M):
+#                 for l in range(N):
+#                     angle = torch.tensor(2j * cmath.pi * ((k-M/2) * x[m][n] / M + (l-N/2) * y[m][n] / N))
+#                     sum_val += freq_data[k, l] * torch.exp(angle)
+#             time_data[m, n] = sum_val / (M * N)
+
+#     return time_data
+# def manual_ifft2_value(freq_data,value):
+#     M, N = freq_data.shape
+#     # time_data = torch.zeros((M, N), dtype=torch.cfloat)
+
+#     # for m in range(M):
+#     #     for n in range(N):
+#     sum_val = 0
+#     for k in range(M):
+#         for l in range(N):
+#             angle = torch.tensor(2j * cmath.pi * ((k-M/2) * value[0] / M + (l-N/2) * value[1] / N))
+#             sum_val += freq_data[k, l] * torch.exp(angle)
+#     time_data = sum_val / (M * N)
+
+#     return time_data
+
+# # Example usage
+
+# M = 20
+# N = 20
+
+# x = torch.linspace(-0.5,0.5,M)
+# y = torch.linspace(-0.5,0.5,N)
+# x,y = torch.meshgrid(x,y)
+# function_data = torch.exp(x**2+y**2)
+# value = torch.tensor((0.3,0.2))
+# function_value = torch.exp(torch.tensor(0.3**2) + torch.tensor(0.2**2))
+# freq_data = torch.fft.fft2(function_data)
+# reconstructed_data_manual = manual_ifft2(freq_data)
+# reconstructed_function_value = manual_ifft2_value(freq_data,value)
+
+# # print("Original Data:\n", data)
+# # print("Reconstructed Data (Manual Inverse FFT):\n", reconstructed_data_manual.real)
+# print("Error in the reconstruction",torch.mean(reconstructed_data_manual.real - function_data))
+# print("Reconstructed Function Value (Manual Inverse FFT):\n", reconstructed_function_value.real)
+# print("True function value",function_value)
+# print("Error in the reconstruction function value",torch.mean(reconstructed_function_value.real - function_value))
 
 import math
 import pdb
-def calculate_normalisation_const(energy,grid_size,range_x_diff,range_y_diff):
+band_limit=(100,100)
+def calculate_normalisation_const(energy):
+  grid_size = (100,100)
   max_values = torch.min(energy,dim=-1,keepdim=True)[0]
-  max_values = torch.min(max_values, dim=1,keepdim=True)[0]
-  # print(max_values.shape)
+  max_values = torch.min(max_values, dim=0,keepdim=True)[0]
   moments = torch.fft.fft2(torch.exp(energy-max_values))
-  ln_z_ = torch.log(moments[:,0,0] * ((range_x_diff * range_y_diff) / math.prod(grid_size))).unsqueeze(-1).unsqueeze(-1) + max_values
+  ln_z_ = torch.log(moments[0,0] / math.prod(grid_size)) + max_values
   return ln_z_.real
 
 
-def loss_fn(energy, value,range_x,range_y,grid_size,step_t):
+def loss_fn(energy, value):
+  min_x = -0.5
+  min_y = -0.5
+  grid_size = (100,100)
+  step_t = [0.01,0.01]
 
 
-  id_x = ((value[:,0] - range_x[0])/step_t[0]).to(torch.int) # [batchsize]
-  id_y = ((value[:,1] - range_y[0])/step_t[1]).to(torch.int)
+  id_x = (value[0] - min_x)/step_t[0]
+  id_y = (value[1] - min_y)/step_t[1]
 
-  # eta = torch.fft.fft2(energy) #[batchsize,grid_size1, grid_size2]
+  eta = torch.fft.fftshift(torch.fft.fft2(energy))
 
-  # k_x = torch.arange(grid_size[0]) # [grid_size1]
-  # k_y = torch.arange(grid_size[1]) # [grid_size2]
+  k_x = torch.arange(grid_size[0])
+  k_y = torch.arange(grid_size[1])
 
-  # temp_x = id_x.unsqueeze(-1) * k_x.unsqueeze(0) #[batchsize,grid_size1]
-  # temp_y = id_y.unsqueeze(-1) * k_y.unsqueeze(0) #[batchsize,grid_size2]
+  temp_x = id_x * k_x.unsqueeze(0)
+  temp_y = id_y * k_y.unsqueeze(0)
 
-  # exp_x = torch.exp(2j * math.pi * temp_x/grid_size[0])
-  # exp_y = torch.exp(2j * math.pi * temp_y/grid_size[1])
+  exp_x = torch.exp(2j * math.pi * temp_x/grid_size[0])
+  exp_y = torch.exp(2j * math.pi * temp_y/grid_size[1])
 
-  # temp = torch.matmul(eta,exp_x.unsqueeze(-1)).squeeze(-1)
+  temp = torch.matmul(exp_x, eta)
+  reconstructed = (torch.matmul(temp, exp_y.T) / math.prod(grid_size)).real
+  # ln_z_ = calculate_normalisation_const(energy)
 
-  # reconstructed = (torch.matmul(temp.unsqueeze(1), exp_y.unsqueeze(-1)) / math.prod(grid_size)).real
+  ln_z = torch.log(torch.sum(torch.exp(energy))/math.prod(grid_size))
+
+  print("Numerical log Z:", ln_z)
+
+  print("Log of likelihood at value",reconstructed)
+
+  print("log Z moments",calculate_normalisation_const(energy))
+
+  print("Integrating the distribution",torch.sum(torch.exp(energy)/torch.exp(ln_z))*step_t[0]*step_t[1])
+
+  return  reconstructed.item() - ln_z.item()
+
+import torch
+import math
+
+def multivariate_energy(mean, covariance):
+    d = mean.shape[0]
+    print(d)
+    x = torch.linspace(-0.5, 0.5, band_limit[0]+1)[:-1]
+    y = torch.linspace(-0.5, 0.5, band_limit[1]+1)[:-1]
+    x, y = torch.meshgrid(x, y)
+
+    samples = torch.stack([x,y],dim=-1)
+
+    covariance_inv = torch.inverse(covariance)
+    covariance_det = torch.det(covariance)
+
+    diff = samples - mean.unsqueeze(0).unsqueeze(0)
+    quadratic_term = torch.einsum('aci,ij,acj->ac', diff, covariance_inv, diff)
+
+    normalization_factor = ((2 * math.pi) ** (d / 2)) * torch.sqrt(covariance_det)
+    energy  = -0.5 * quadratic_term
+
+    log_pdf = -0.5 * quadratic_term - torch.log(normalization_factor)
+
+    return energy, log_pdf
+
+def multivariate_normal_density_value(value,mean, covariance):
+    d = mean.shape[0]
+
+    covariance_inv = torch.inverse(covariance)
+    covariance_det = torch.det(covariance)
+
+    diff = (value - mean).unsqueeze(0)
+
+    quadratic_term = torch.einsum('ai,ij,aj-> a', diff, covariance_inv, diff)
+
+    normalization_factor = ((2 * math.pi) ** (d / 2)) * torch.sqrt(covariance_det)
+    log_pdf = -0.5 * quadratic_term - torch.log(normalization_factor)
+
+    return log_pdf,normalization_factor
+
+torch.diag(torch.tensor([0.5,0.5]))
+
+mean = torch.Tensor([0,0])
+covariance = torch.eye(2)*0.5
+energy_value,log_pdf = multivariate_energy(mean,covariance)
+
+temp_1 = loss_fn(energy_value,value=(0.2,0.2))
+
+value = torch.Tensor([0.2,0.2])
+log_density_value,nf= multivariate_normal_density_value(value, mean, covariance)
+
+temp_1 - log_density_value
+
+mean = torch.Tensor([0.1,0.1])
+covariance = torch.eye(2)*0.2
+energy_value,log_pdf = multivariate_energy(mean,covariance)
+temp_2 = loss_fn(energy_value,value=(0.15,0.15))
+value = torch.Tensor([0.15,0.15])
+log_density_value_2,nf= multivariate_normal_density_value(value, mean, covariance)
+
+torch.log(nf)
+
+log_density_value_2 - temp_2
+
+import torch
+band_limit=(100,100)
+def integrate_2d(f, x_range=(-5, 5), y_range=(-5, 5), N=1000):
+    """
+    Numerically integrate a function f(x, y) over a 2D region using a grid-based method.
+
+    Args:
+        f (function): The function to integrate. It should take two tensors as input: (x, y).
+        x_range (tuple): The range of x values (min, max).
+        y_range (tuple): The range of y values (min, max).
+        N (int): The number of grid points along each axis.
+
+    Returns:
+        float: The approximate value of the integral.
+    """
+    # Generate x and y values over the specified ranges
+    x = torch.linspace(x_range[0], x_range[1], N)
+    y = torch.linspace(y_range[0], y_range[1], N)
+    dx = (x_range[1] - x_range[0]) / (N - 1)
+    dy = (y_range[1] - y_range[0]) / (N - 1)
+
+    # Create a meshgrid for x and y
+    grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
+
+    # Evaluate the function on the grid
+    values = f(grid_x, grid_y)
+
+    # Sum over all grid points and multiply by the area of each cell (dx * dy)
+    integral = torch.sum(values) * dx * dy
+    return integral.item()
+
+# Define a normalized 2D Gaussian function
+def gaussian_2d(x, y, mean=(0, 0), sigma=1.0):
+    """A normalized 2D Gaussian function centered at mean with standard deviation sigma."""
+    normalization_factor = 1 / (2 * torch.pi * sigma**2)
+    exponent = -((x - mean[0])**2 + (y - mean[1])**2) / (2 * sigma**2)
+    return normalization_factor * torch.exp(exponent), torch.exp(exponent)
+
+def normalized_gaussian_2d_grid(x_range=(-0.5, 0.5), y_range=(-0.5, 0.5),mean=(0, 0), sigma=1.0):
+    """A normalized 2D Gaussian function centered at mean with standard deviation sigma."""
+    x = torch.linspace(x_range[0], x_range[1], band_limit[0]+1)[:-1]
+    y = torch.linspace(y_range[0], y_range[1], band_limit[1]+1)[:-1]
+    grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
+    normalised_density,unnormalised_density = gaussian_2d(grid_x,grid_y,mean,sigma)
+    return normalised_density,torch.log(unnormalised_density)
+
+# # Perform the integration with the normalized Gaussian
+# result = integrate_2d(normalized_gaussian_2d)
+# print(f"Approximate integral: {result}")
+
+density,energy = normalized_gaussian_2d_grid(x_range=(-0.5, 0.5), y_range=(-0.5, 0.5),mean=(0, 0), sigma=1.0)
+
+density_1,unnorm_density = gaussian_2d(torch.tensor(0.2), torch.tensor(0.2), mean=(0, 0), sigma=1.0)
+true_value= torch.log(density_1)
+true_value
+
+torch.log(unnorm_density)
+
+loss_fn(energy,value=(0.2,0.2))
 
 
-  # range_x_diff = range_x[1] - range_x[0]
-  # range_y_diff = range_y[1] - range_y[0]
 
-  # # ln_z = calculate_normalisation_const(energy,grid_size,range_x_diff,range_y_diff)
+# prompt: numerical integration of probabiity density
 
+import torch
+import math
 
+def numerical_integration(energy):
+    """
+    Performs numerical integration of a probability density represented by an energy function.
 
-  # pdb.set_trace()
+    Args:
+        energy: A 2D PyTorch tensor representing the energy function on a grid.
 
-  # z = (torch.sum(energy,dim=(1,2))*((range_x_diff * range_y_diff)/math.prod(grid_size))).unsqueeze(-1).unsqueeze(-1)
+    Returns:
+        The numerical integral of the probability density.
+    """
 
-  # print("checking loss function")
-  check_tensor_nan(z)
-  check_tensor_nan(reconstructed)
-  # print("finished checking loss function")
-  # print("Numerical log Z:", ln_z[:2])
+    # Convert energy to probability density using Boltzmann distribution
+    probability_density = torch.exp(energy)
+    step_t = [0.01,0.01]
 
-  # print("Log of likelihood at value", reconstructed[:2])
+    # Calculate the integral using the trapezoidal rule.
+    # dx = 1.0 / energy.shape[0]
+    # dy = 1.0 / energy.shape[1]
 
-  # print("log Z moments",calculate_normalisation_const(energy))
+    integral = 0.0
+    for i in range(energy.shape[0]):
+        for j in range(energy.shape[1]):
+            integral += probability_density[i,j]
 
-  # print("Integrating the distribution",torch.mean(torch.sum(torch.exp(energy)/torch.exp(ln_z),dim=(1,2))*step_t[0]*step_t[1]))
+    integral = integral*step_t[0]*step_t[1]
 
+    return integral
 
-
-  # return  - torch.mean(torch.log(reconstructed/z))
-  return - torch.mean(torch.log(energy[torch.arange(energy.shape[0]),id_x,id_y]))
-
-predicted_density[11]
-
-mean = torch.tensor([0.0, 0.0]).unsqueeze(0)
-std = 0.1
-band_limit = (50,50)
-density = calculate_gaussian_energy(mean,std,band_limit)
-
-
-
-plot_gaussian_energy(predicted_density[11].detach())
-
-value = torch.tensor([-0.4, 0.4]).unsqueeze(0)
-
-predicted_density[11][5][45]
-
-loss_fn(predicted_density[11].unsqueeze(0),value,range_x,range_y,band_limit,step_t)
-
-predicted_density[11][5][45]
-
-grid_size = band_limit
-range_x = (-0.5,0.5)
-range_y = (-0.5,0.5)
-step_t = [0.02,0.02]
-energy = predicted_density[11].unsqueeze(0)
-
-id_x = ((value[:,0] - range_x[0])/step_t[0]).to(torch.int).to(torch.float) # [batchsize]
-id_y = ((value[:,1] - range_y[0])/step_t[1]).to(torch.int).to(torch.float)
-
-eta = torch.fft.fft2(energy) #[batchsize,grid_size1, grid_size2]
-
-k_x = torch.arange(grid_size[0]) # [grid_size1]
-k_y = torch.arange(grid_size[1]) # [grid_size2]
-
-temp_x = id_x.unsqueeze(-1) * k_x.unsqueeze(0) #[batchsize,grid_size1]
-temp_y = id_y.unsqueeze(-1) * k_y.unsqueeze(0) #[batchsize,grid_size2]
-
-exp_x = torch.exp(2j * math.pi * temp_x/grid_size[0])
-exp_y = torch.exp(2j * math.pi * temp_y/grid_size[1])
-
-temp = torch.matmul(eta,exp_x.unsqueeze(-1)).squeeze(-1)
-
-reconstructed = (torch.matmul(temp.unsqueeze(1), exp_y.unsqueeze(-1)) / math.prod(grid_size)).real
-
-
-range_x_diff = range_x[1] - range_x[0]
-range_y_diff = range_y[1] - range_y[0]
-
-# ln_z = calculate_normalisation_const(energy,grid_size,range_x_diff,range_y_diff)
-
-
-
-# pdb.set_trace()
-
-z = (torch.sum(energy,dim=(1,2))*((range_x_diff * range_y_diff)/math.prod(grid_size))).unsqueeze(-1).unsqueeze(-1)
-
-id_y
+loss_fn(energy_value,value)
 
 n_samples = 100
 trajectory_length = 100
 measurement_noise = 0.2
 batch_size = 50
-step_t=[0.02,0.02]
-initial_noise = 0.1
-band_limit=(50,50)
-range_x = (-0.5,0.5)
-range_y = (-0.5,0.5)
-range_x_diff = range_x[1] - range_x[0]
-range_y_diff = range_y[1] - range_y[0]
+step_t=[0.01,0.01]
+initial_cov = 0.01
+band_limit=(100,100)
 
-true_trajectories, measurements = generating_data_R2(n_samples, trajectory_length, measurement_noise, step_t,range_x,range_y)
+true_trajectories, measurements = generating_data_R2(n_samples, trajectory_length, measurement_noise, step_t)
 measurements_ = torch.from_numpy(measurements).type(torch.FloatTensor)
 ground_truth_ = torch.from_numpy(true_trajectories).type(torch.FloatTensor)
 ground_truth_flatten = torch.flatten(ground_truth_,start_dim=0,end_dim=1).type(torch.FloatTensor)
 measurements_flatten = torch.flatten(measurements_,start_dim=0,end_dim=1).type(torch.FloatTensor)
 
-def calculate_gaussian_energy(mean,std,band_limit):
-    n_samples = mean.shape[0]
-    # Create a meshgrid for the x and y coordinates
-    x = torch.linspace(-0.5, 0.5, band_limit[0]+1)[:-1]
-    y = torch.linspace(-0.5, 0.5, band_limit[1]+1)[:-1]
-    x, y = torch.meshgrid(x, y)
+# @title
 
-    # Convert to numpy arrays for compatibility (if needed)
-    x = torch.tile(x.unsqueeze(0),(n_samples,1,1))  # Add batch dimension
-    y = torch.tile(y.unsqueeze(0),(n_samples,1,1))
 
-    # Calculate the true unnormalized density for each ground truth point in the batch
-    exponent =  -((x - mean[:, 0:1, None])**2 / (2 * std**2)) - ((y - mean[:, 1:2, None])**2 / (2 * std**2))
-    normalization = torch.tensor(2*math.pi*(std**2))
-    return torch.exp(exponent)/normalization
+# def calculate_gaussian_energy(mean,cov,band_limit):
+#     # n_samples = mean.shape[0]
+#     # Create a meshgrid for the x and y coordinates
+#     x = torch.linspace(-0.5, 0.5, band_limit[0])
+#     y = torch.linspace(-0.5, 0.5, band_limit[1])
+#     x, y = torch.meshgrid(x, y)
 
-pose_energy = torch.clamp(calculate_gaussian_energy(ground_truth_flatten,initial_noise,band_limit),min=1e-8)
+#     # Convert to numpy arrays for compatibility (if needed)
+#     x = torch.tile(x.unsqueeze(0),(n_samples,1,1))  # Add batch dimension
+#     y = torch.tile(y.unsqueeze(0),(n_samples,1,1))
 
-plot_gaussian_energy(pose_energy[0])
+#     # Calculate the true unnormalized density for each ground truth point in the batch
+#     exponent =  -((x - mean[:, 0:1, None])**2 / (2 * cov**2)) - ((y - mean[:, 1:2, None])**2 / (2 * cov**2)) #[n_samples,bandlimit_x,bandlimit_y]
+#     min_values = torch.min(exponent,dim=-1,keepdim=True)[0]
+#     min_values = torch.min(min_values, dim=1,keepdim=True)[0]
+#     print(min_values)
+#     true_unnorm_density = torch.exp(exponent  - min_values)
+#     log_density = torch.log(true_unnorm_density) + min_values
+#     log_density = torch.clamp(log_density, min=-1e9)
+#     # Return the log of the true unnormalized density
+#     return log_density
+
+# @title
+# pose_energy = calculate_gaussian_energy(ground_truth_flatten[:5],initial_cov,band_limit)
+
+pose_energy = multivariate_normal_density_batch(ground_truth_flatten,torch.Tensor(np.eye(2)*initial_cov))
+
+torch.isinf(pose_energy).any()
 
 def plot_gaussian_energy(energy):
   fig, axs = plt.subplots(1, figsize=(10, 8),subplot_kw={'projection': '3d'})
-  x = np.linspace(-0.5, 0.5, band_limit[0],endpoint=False)
-  y = np.linspace(-0.5, 0.5, band_limit[1],endpoint=False)
+  x = np.linspace(-0.5, 0.5, band_limit[0])
+  y = np.linspace(-0.5, 0.5, band_limit[1])
   x, y = np.meshgrid(x, y)
-  # density = torch.exp(energy) / torch.sum(torch.exp(energy))
-  temp = axs.contour3D(x, y, energy.numpy(), 50, cmap='viridis')
+  density = torch.exp(energy) / torch.sum(torch.exp(energy))
+  temp = axs.contour3D(x, y, density.numpy(), 50, cmap='viridis')
   # temp_1 = axs[0,1].contour3D(x_numpy, y_numpy, true_density.numpy(), 50, cmap='viridis')
 
   # Add labels and title
@@ -238,7 +715,6 @@ def plot_gaussian_energy(energy):
 train_dataset = torch.utils.data.TensorDataset(ground_truth_flatten, pose_energy, measurements_flatten)
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, drop_last=True, shuffle=True)
 
-from posix import X_OK
 # prompt: write a neural network class that takes in input as dimension 2 and outputs unnormalised log density over size (50,50), Use sigmoid for itermitant layers and relu for the last layer
 
 import torch
@@ -250,9 +726,9 @@ class NeuralNetwork(nn.Module):
         self.batch_size = batch_size
         self.band_limit_x, self.band_limit_y = grid_size
         output_dim = self.band_limit_x * self.band_limit_y
-        self.layer1 = nn.Linear(input_dim, 1000)
-        self.layer2 = nn.Linear(1000,2000)
-        self.layer3 = nn.Linear(2000, output_dim)
+        self.layer1 = nn.Linear(input_dim, 7000)
+        self.layer2 = nn.Linear(7000,5000)
+        self.layer3 = nn.Linear(5000, output_dim)
         self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU()
 
@@ -262,9 +738,8 @@ class NeuralNetwork(nn.Module):
         x = self.sigmoid(self.layer1(input_energy_reshaped))
         x = self.sigmoid(self.layer2(x))
         x = self.layer3(x)
-        x = self.relu(x)
         x = x.view(-1, self.band_limit_x, self.band_limit_y)
-        return torch.clamp(x,min=1e-8,max=50)
+        return input_energy + x
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
@@ -316,15 +791,20 @@ def init_weights(m):
 
 #   return true_trajectories, measurements
 
-def convert_energy_density(energy,grid_size,range_x_diff,range_y_diff):
-  # ln_z_ = calculate_normalisation_const(energy,grid_size,range_x_diff,range_y_diff)
-  ln_z_ = torch.log(torch.sum(torch.exp(energy),dim=(1,2))*((range_x_diff * range_y_diff)/math.prod(grid_size))).unsqueeze(-1).unsqueeze(-1)
+def convert_energy_density(energy,grid_size):
+  max_values = torch.min(energy,dim=-1,keepdim=True)[0]
+  max_values = torch.min(max_values, dim=1,keepdim=True)[0]
+  moments = torch.fft.fft2(torch.exp(energy + max_values))
+  ln_z_ = torch.log(2*math.pi* moments[...,0,0] / math.prod(grid_size)).real.unsqueeze(-1).unsqueeze(-1) - max_values
   return torch.exp(energy - ln_z_)
 
 def check_model_weights_nan(model):
     for name, param in model.named_parameters():
         if torch.isnan(param).any():
             print(f"NaN detected in model weights: {name}")
+            return True
+    print("No NaNs in model weights.")
+    return False
 
 def get_gradients(model):
     gradients = []
@@ -333,24 +813,10 @@ def get_gradients(model):
             gradients.append(param.grad.norm().item())
     return gradients
 
-# prompt: Write a function to check if the tensor has nan values and print statements
-
-def check_tensor_nan(tensor):
-    if torch.isnan(tensor).any():
-        print("Tensor contains NaN values.")
-
-def convolution_distribution(distribution_1,distribution_2,range_x_diff ,range_y_diff,grid_size):
-  unnorm_dist = torch.fft.ifft2(torch.fft.fft2(distribution_1) * torch.fft.fft2(distribution_2)).real
-  moments = torch.fft.fft2(unnorm_dist)
-  z = (moments[:,0,0].real * ((range_x_diff * range_y_diff) / math.prod(grid_size))).unsqueeze(-1).unsqueeze(-1)
-  return unnorm_dist/z
-
 # prompt: Write a training loop that call the meausrement model with flattened input of ground truth and learn the loss function on measurements as my target
 
 import torch
 import torch.optim as optim
-import os
-import datetime
 
 # Assuming you have defined NeuralNetwork, loss_fn, train_loader, etc. as in your provided code.
 
@@ -365,39 +831,34 @@ model.apply(init_weights)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 loss_list = []
 
-# Creating folders to log
-run_name = "Uncertainity Estimation in R2"
-
-current_datetime = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-log_dir = os.path.join("logs", run_name, current_datetime)
-os.makedirs(log_dir, exist_ok=True)
-
 
 # Training loop
 for epoch in range(num_epochs):
   loss_tot = 0
   for batch_idx, (ground_truth, ground_truth_energy, measurements) in enumerate(train_loader):
 
-    check_model_weights_nan(model)
-    # print(batch_idx)
-    outputs = model(ground_truth_energy)
-    # print(torch.max(outputs))
-    check_tensor_nan(outputs)
-    predicted_density = convolution_distribution(ground_truth_energy,outputs,range_x_diff,range_y_diff,band_limit)
-    loss = loss_fn(predicted_density, measurements ,range_x,range_y,band_limit,step_t)
-    # print(loss)
     optimizer.zero_grad()
+
+    check_model_weights_nan(model)
+
+
+    outputs = model(ground_truth_energy)
+    # print(outputs)
+
+    loss = loss_fn(outputs, measurements ,band_limit) # Example: Assume grid size of 10x10
+
+    normalised_density = convert_energy_density(outputs,band_limit)
+
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
     loss_tot +=loss.item()
-
-    if batch_idx==0 and epoch % 10 == 0:
-      epoch_dir = log_dir + f"/epoch_{epoch}"
-      os.makedirs(epoch_dir, exist_ok=True)
-      plot_3d_surface(ground_truth[sample_idx],measurements[sample_idx],measurement_noise,band_limit,predicted_density[sample_idx],ground_truth_energy[sample_idx],epoch_dir)
+    print(get_gradients(model))
+    # if batch_idx==0 and epoch % 10 == 0:
+    #   plot_3d_surface(ground_truth[sample_idx],measurements[sample_idx],measurement_noise,band_limit,normalised_density[sample_idx],ground_truth_energy[sample_idx])
 
     # Print training progress (optional)
-  print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx}/{len(train_loader)}], Loss: {loss_tot/len(train_loader):.4f}")
+  print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss_tot/len(train_loader):.4f}")
 
 
   loss_list.append(loss_tot/len(train_loader))
@@ -451,61 +912,57 @@ plt.show()
 # Create a 3D figure
 
 
-def plot_3d_surface(ground_truth,measurement,measurement_noise, band_limit,predicted_density,input_energy,folder_path):
-  x = torch.linspace(-0.5, 0.5, band_limit[0]+1)[:-1]
-  y = torch.linspace(-0.5, 0.5, band_limit[1]+1)[:-1]
+def plot_3d_surface(ground_truth,measurement,measurement_noise, band_limit,predicted_density,true_energy):
+  x = torch.linspace(-0.5, 0.5, band_limit[0])
+  y = torch.linspace(-0.5, 0.5, band_limit[1])
   x, y = torch.meshgrid(x, y)
   x_numpy = x.numpy()
   y_numpy = y.numpy()
 
   predicted_density = predicted_density.detach()
 
-  true_density = calculate_gaussian_energy(ground_truth.unsqueeze(0),measurement_noise,band_limit).squeeze(0)
-  # true_density = torch.exp(true_energy) / torch.sum(torch.exp(true_energy))
+  # Normalize the PDF so it integrates to 1
+  true_density = torch.exp(true_energy) / torch.sum(torch.exp(true_energy))
 
-  # input_energy = input_energy.detach()
-  # input_energy = torch.exp(input_energy) / torch.sum(torch.exp(input_energy))
+  fig, axs = plt.subplots(2, 2, figsize=(10, 8),subplot_kw={'projection': '3d'})
 
-  plotting_3d_density(x_numpy,y_numpy,predicted_density,true_density,folder_path)
-  histogram_density(measurement, ground_truth, predicted_density, "predicted_density",folder_path)
-  histogram_density(measurement, ground_truth, input_energy, "input_energy",folder_path)
-  histogram_density(measurement, ground_truth, true_density, "true_energy",folder_path)
+  temp = axs[0,0].contour3D(x_numpy, y_numpy, predicted_density.numpy(), 50, cmap='viridis')
+  temp_1 = axs[0,1].contour3D(x_numpy, y_numpy, true_density.numpy(), 50, cmap='viridis')
 
-def histogram_density(measurements_2d,pose_2d,normalised_density,legend,folder_path):
+  # Add labels and title
+  axs[0,0].set_xlabel('x')
+  axs[0,0].set_ylabel('y')
+  axs[0,0].set_zlabel('Predicted distribution')
+
+  axs[0,1].set_xlabel('x')
+  axs[0,1].set_ylabel('y')
+  axs[0,1].set_zlabel('True distribution')
+
+  histogram_density(measurement, ground_truth,predicted_density,"predicted_density_grid",ax=axs[1,0])
+  histogram_density(measurement, ground_truth,true_density,"true_density_grid",ax=axs[1,1])
+
+
+  # Add a color bar to show the values of z
+  fig.colorbar(temp, ax=axs[0,0], shrink=0.5, aspect=5)
+  fig.colorbar(temp_1, ax=axs[0,1], shrink=0.5, aspect=5)
+
+  # Show the plot
+  plt.show()
+
+def histogram_density(measurements_2d,pose_2d,normalised_density,legend,ax):
   # Create a 2D histogram of the output energy distribution
-  plt.figure(figsize=(10, 8))
-  plt.imshow(normalised_density.detach().numpy(), cmap='viridis', origin='lower', extent=[-0.5, 0.5, -0.5, 0.5])
+  ax.imshow(normalised_density.detach().numpy(), cmap='viridis', origin='lower', extent=[-0.5, 0.5, -0.5, 0.5])
   plt.colorbar(label='Density')
   plt.title(legend)
 
   # Plot the measurement point
-  plt.scatter(measurements_2d[0].item(), measurements_2d[ 1].item(), color='red', label='Measurement', s=50)
-  plt.scatter(pose_2d[0].item(), pose_2d[ 1].item(), color='blue', label='Pose', s=50)
+  ax.scatter(measurements_2d[0].item(), measurements_2d[ 1].item(), color='red', label='Measurement', s=50)
+  ax.scatter(pose_2d[0].item(), pose_2d[ 1].item(), color='blue', label='Pose', s=50)
   plt.xlabel('x')
   plt.ylabel('y')
-  plt.legend()
-  plt.savefig(folder_path + "/" + legend + ".png")
-
-def plotting_3d_density(x,y,predicted_density,true_density,folder_path):
-  fig, axs = plt.subplots(2, figsize=(10, 8),subplot_kw={'projection': '3d'})
-
-  temp = axs[0].contour3D(x, y, predicted_density.numpy(), 50, cmap='viridis')
-  temp_1 = axs[1].contour3D(x, y, true_density.numpy(), 50, cmap='viridis')
-
-  # Add labels and title
-  axs[0].set_xlabel('x')
-  axs[0].set_ylabel('y')
-  axs[0].set_zlabel('Predicted distribution')
-
-  axs[1].set_xlabel('x')
-  axs[1].set_ylabel('y')
-  axs[1].set_zlabel('True distribution')
-
-  # Add a color bar to show the values of z
-  fig.colorbar(temp, ax=axs[0], shrink=0.5, aspect=5)
-  fig.colorbar(temp_1, ax=axs[0], shrink=0.5, aspect=5)
-
-  plt.savefig(folder_path + "/plot3d")
+  ax.legend()
+  plt.show()
+  return ax
 
 import torch
 import numpy as np

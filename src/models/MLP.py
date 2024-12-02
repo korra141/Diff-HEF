@@ -6,9 +6,9 @@ class NeuralNetwork(nn.Module):
         self.batch_size = batch_size
         self.band_limit_x, self.band_limit_y = grid_size
         output_dim = self.band_limit_x * self.band_limit_y
-        self.layer1 = nn.Linear(input_dim, 1000)
-        self.layer2 = nn.Linear(1000,2000)
-        self.layer3 = nn.Linear(2000, output_dim)
+        self.layer1 = nn.Linear(input_dim, 200)
+        self.layer2 = nn.Linear(200,300)
+        self.layer3 = nn.Linear(300, output_dim)
         self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU()
 
@@ -20,7 +20,7 @@ class NeuralNetwork(nn.Module):
         x = self.layer3(x)
         x = self.relu(x)
         x = x.view(-1, self.band_limit_x, self.band_limit_y)
-        return torch.clamp(x,min=1e-8,max=50)
+        return torch.clamp(-x,min=-10) + input_energy
 
 def init_weights(m):
         if isinstance(m, nn.Linear):

@@ -5,6 +5,7 @@ import numpy as np
 from scipy.special import i0
 import os
 import imageio
+import re
 import pdb
 
 def plot_s1_func(f, legend=None, ax=None, plot_type: str = 'polar'):
@@ -108,14 +109,14 @@ def generate_gif(image_folder, gif_name,prefix=None,duration=1):
     gif_name: The name of the output GIF file.
     """
     images = []
-    for filename in sorted(os.listdir(image_folder)):
+    for filename in sorted(os.listdir(image_folder),key = lambda x : int(re.search(r'\d+', x).group())):
         if filename.endswith(".png") and (prefix is None or filename.startswith(prefix)): # Adjust file extension if needed
           image_path = os.path.join(image_folder, filename)
           images.append(imageio.imread(image_path))
     # pdb.set_trace()
     imageio.mimsave(gif_name, images,duration=duration)  # Adjust fps as needed
 
-def plot_3d(ground_truth,measurement,range_x,range_y,band_limit,true_density, predicted_density,input_energy,folder_path, iteration, output=None):
+def plot_3d(ground_truth,measurement,range_x,range_y,band_limit,true_density, predicted_density,input_energy,folder_path, iteration=None, output=None):
   x = torch.linspace(range_x[0], range_x[1], band_limit[0]+1)[:-1]
   y = torch.linspace(range_y[0], range_y[1], band_limit[1]+1)[:-1]
   x, y = torch.meshgrid(x, y)
@@ -131,11 +132,14 @@ def plot_3d(ground_truth,measurement,range_x,range_y,band_limit,true_density, pr
     histogram_density(measurement, ground_truth, output, "delta density predicted", axs[1,0])
   
   plt.tight_layout()
-  fig.suptitle(f"Analytical filter at iteration {iteration} plots")
-  plt.savefig(folder_path + f"/hef_2d_plots_{iteration}.png")
+  if iteration is not None:
+    fig.suptitle(f"Analytical filter at iteration {iteration} plots")
+    plt.savefig(folder_path + f"/hef_2d_plots_{iteration}.png")
+  else:
+    plt.savefig(folder_path + f"/hef_2d_plots.png")
   plt.close()
 
-def plot_3d_density(ground_truth,measurement,range_x,range_y,band_limit,folder_path, dict_density,title):
+def plot_3d_density(ground_truth,measurement,range_x,range_y,band_limit,folder_path, dict_density,title,iter=None):
   x = torch.linspace(range_x[0], range_x[1], band_limit[0]+1)[:-1]
   y = torch.linspace(range_y[0], range_y[1], band_limit[1]+1)[:-1]
   x, y = torch.meshgrid(x, y)
@@ -147,14 +151,20 @@ def plot_3d_density(ground_truth,measurement,range_x,range_y,band_limit,folder_p
   # True and Predicted density
   plotting_3d_density(x_numpy,y_numpy,values[0].detach(), values[1].detach(),folder_path)
 
-  fig, axs = plt.subplots(2, 2, figsize=(16, 16))
+  fig, axs = plt.subplots(2, 3, figsize=(16, 16))
   histogram_density(measurement, ground_truth, values[0].detach(), keys[0], axs[0,0])
   histogram_density(measurement, ground_truth, values[1].detach(), keys[1], axs[0,1])
   histogram_density(measurement, ground_truth, values[2].detach(), keys[2], axs[1,1])
+  if len(values) > 3:
+    histogram_density(measurement, ground_truth, values[3].detach(), keys[3], axs[1,0])
+    histogram_density(measurement, ground_truth, values[4].detach(), keys[4], axs[1,2])
   
   plt.tight_layout()
   fig.suptitle(title)
-  plt.savefig(folder_path + f"/2d_plots.png")
+  if iter is not None:
+    plt.savefig(folder_path + f"/2d_plots_{iter}.png",dpi=100)
+  else:
+    plt.savefig(folder_path + f"/2d_plots.png",dpi=100)
   plt.close()
 
 def histogram_density(measurements_2d, pose_2d, normalised_density, legend, ax):
@@ -235,29 +245,28 @@ def plot_gaussian_energy(energy):
   # Show the plot
   plt.show()
 
-def plot_3d_filter(ground_truth,measurement,range_x,range_y,band_limit, true_density, predicted_density, predicted_belief, posterior, folder_path,traj_iter):
+def plot_3d_analytic_filter(ground_truth,measurement,range_x,range_y,band_limit,folder_path, dict_density,title,iter=None):
   x = torch.linspace(range_x[0], range_x[1], band_limit[0]+1)[:-1]
   y = torch.linspace(range_y[0], range_y[1], band_limit[1]+1)[:-1]
   x, y = torch.meshgrid(x, y)
   x_numpy = x.numpy()
-  y_numpy = y.numpy()
+  y_numpy = y.numpy()  
 
-  predicted_density = predicted_density.detach()
-  predicted_belief = predicted_belief.detach()
-  posterior = posterior.detach()
+  values = list(dict_density.values())
+  keys = list(dict_density.keys())
 
-  plotting_3d_density(x_numpy,y_numpy,true_density,predicted_density,folder_path,traj_iter)
   fig, axs = plt.subplots(2, 3, figsize=(16, 16))
-
-  histogram_density(measurement, ground_truth, predicted_density, "measurement", axs[0,0])
-  histogram_density(measurement, ground_truth, true_density, "analytic filter measurement model", axs[0,1])
-  # histogram_density(measurement, ground_truth, process, "process", axs[0,2])
-  histogram_density(measurement, ground_truth, predicted_belief, "predicted_belief", axs[1,0])
-  # histogram_density(measurement, ground_truth, true_density, "true_density", axs[1,1])
-  histogram_density(measurement, ground_truth, posterior, "posterior", axs[1,2])
+  histogram_density(measurement, ground_truth, values[0].detach(), keys[0], axs[0,0])
+  histogram_density(measurement, ground_truth, values[1].detach(), keys[1], axs[0,1])
+  histogram_density(measurement, ground_truth, values[2].detach(), keys[2], axs[1,1])
+  if len(values) > 3:
+    histogram_density(measurement, ground_truth, values[3].detach(), keys[3], axs[1,0])
+    histogram_density(measurement, ground_truth, values[4].detach(), keys[4], axs[1,2])
   
-
-  fig.suptitle(f"Learning Filter Trajectory {traj_iter}")
   plt.tight_layout()
-  plt.savefig(folder_path + f"/2d_plots_{traj_iter}.png")
+  fig.suptitle(title)
+  if iter is not None:
+    plt.savefig(folder_path + f"/hef_2d_plots_{iter}.png")
+  else:
+    plt.savefig(folder_path + f"/hef_2d_plots.png")
   plt.close()

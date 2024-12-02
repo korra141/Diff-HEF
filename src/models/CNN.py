@@ -67,6 +67,35 @@ class LikelihoodPredicitionCNN(nn.Module):
         x = F.relu(x.squeeze(1))
         x = x[:,1:1+self.grid_size[0], 1:1+self.grid_size[1]]
         return torch.clamp(x,min=1e-10)
+    
+
+class CNNModel_A(nn.Module):
+    def __init__(self, grid_size):
+        super(CNNModel_A, self).__init__()
+        self.grid_size = grid_size
+
+        # Define layers
+        self.input_padding = nn.ReflectionPad2d(1)  # Example padding
+        self.conv1 = nn.Conv2d(1, 4, kernel_size=3,padding=1)
+        self.bn1 = nn.BatchNorm2d(4)  # BatchNorm for conv1
+        self.conv2 = nn.Conv2d(4, 1, kernel_size=3, padding=1)
+        # self.bn2 = nn.BatchNorm2d(1)  # BatchNorm for conv2
+
+
+    def forward(self, input):
+        # Apply layers with BatchNorm and activation
+        x = input.unsqueeze(1)
+        x = self.input_padding(x)
+        x = F.leaky_relu(self.bn1(self.conv1(x)))  # Conv1 + BN + Activation
+        x = F.relu(self.conv2(x).squeeze(1))  # Conv2 + BN + Activation
+        # x = self.conv3(x)  # Conv3
+        # x = self.bn3(x)  # Optional BatchNorm for last layer
+        # x = F.relu(x.squeeze(1))  # Squeeze and ReLU
+        x = x[:, 1:1 + self.grid_size[0], 1:1 + self.grid_size[1]]
+
+        # Clamp output
+        return torch.clamp(x, min=1e-10)
+
         
 
 
@@ -78,6 +107,10 @@ def init_weights_zero(model):
   for layer in model.modules():
     initialize_conv_to_zero(layer)
 
+def init_weights(model):
+    for layer in model.modules():
+        initialize_conv_to_not_zero(layer)
+
 
 def initialize_conv_to_zero(conv_layer):
     """
@@ -88,8 +121,24 @@ def initialize_conv_to_zero(conv_layer):
     if isinstance(conv_layer, nn.Conv2d):
       # Small random initialization for weights
       # nn.init.normal_(conv_layer.weight, mean=0.0, std=1e-3)
-      nn.init.kaiming_uniform_(conv_layer.weight,mode='fan_out', nonlinearity='relu')
+      nn.init.kaiming_uniform_(conv_layer.weight,mode='fan_in', nonlinearity='relu')
       nn.init.constant_(conv_layer.bias, 0.0)
+
+def initialize_conv_to_not_zero(conv_layer,noise_scale=0.01):
+    """
+    Initialize a convolutional layer such that its output is close to zero.
+    Args:
+        conv_layer (nn.Conv2d): The convolutional layer to initialize.
+    """
+    if isinstance(conv_layer, nn.Conv2d):
+      # Small random initialization for weights
+      nn.init.kaiming_normal_(conv_layer.weight, nonlinearity='relu')
+      noise = torch.randn_like(conv_layer.weight) * noise_scale
+      conv_layer.weight.data += noise
+    #   nn.init.kaiming_normal_(conv_layer.weight,mode='fan_in', nonlinearity='leaky_relu')
+      nn.init.constant_(conv_layer.bias, 0.0)
+
+
 
 def initialize_identity_with_torch(conv_layer):
     """

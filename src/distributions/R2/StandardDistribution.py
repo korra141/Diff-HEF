@@ -51,7 +51,7 @@ class GaussianDistribution:
         exponent =  -((x - self.mean[:, 0:1, None])**2 / (2 * self.std**2)) - ((y - self.mean[:, 1:2, None])**2 / (2 * self.std**2))
         normalization = torch.tensor(2*math.pi*(self.std**2))
 
-        return exponent
+        return exponent - torch.log(normalization)
     
 
 class MultiModalGaussianDistribution:

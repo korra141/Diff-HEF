@@ -7,6 +7,10 @@ __pycache__/
 *.so
 
 results/
+wandb/
+logs/
+scripts/logs/
+scripts/UE_R2/logs/
 # Distribution / packaging
 .Python
 build/

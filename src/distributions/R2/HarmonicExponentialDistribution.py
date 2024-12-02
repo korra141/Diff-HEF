@@ -1,7 +1,8 @@
 import torch
 import math
 import numpy as np
-from scipy.stats import norm
+# from scipy.stats import norm
+import pdb
 
 class HarmonicExponentialDistribution:
     def __init__(self, range_x, range_y, bandwidth, step_size):
@@ -56,12 +57,69 @@ class HarmonicExponentialDistribution:
         # print("Integrating the distribution",torch.mean(torch.sum(density/z,dim=(1,2))*step_t[0]*step_t[1]))
 
         return torch.mean(result.squeeze(-1))
+    
+    def loss_energy(self,density,value):
+        """
+        Computes the negative log-likelihood density for a given density and value.
+        Args:
+            density (torch.Tensor): The density tensor of shape [batchsize, grid_size1, grid_size2].
+            value (torch.Tensor): The value tensor of shape [batchsize, 2], where each row represents a point (x, y).
+        Returns:
+            torch.Tensor: The mean negative log-likelihood density.
+        Note:
+            The value should lie on the grid. If it does not, this function will output an incorrect value since it does not use an interpolator.
+        """
+        
+        # id_x = ((value[:,0] - self.range_x[0])/self.step_t[0]).to(torch.int).to(torch.float) # [batchsize]
+        # id_y = ((value[:,1] - self.range_y[0])/self.step_t[1]).to(torch.int).to(torch.float)
+        
+
+        # It is more numerically stable to compute the log of the density and then exponentiate it.
+
+        energy = torch.log(density + 1e-40)
+        ln_z = self.normalization_constant_energy(energy)
+        # print(z)
+        # energy = energy  + torch.log(z)
+      
+        eta = torch.fft.fft2(energy)
+
+        k_x = torch.arange(self.grid_size[0]) 
+        k_y = torch.arange(self.grid_size[1])
+
+        x = (value[:,0] - self.range_x[0])/self.range_x_diff
+        y = (value[:,1] - self.range_y[0])/self.range_y_diff
+
+        temp_x = x.unsqueeze(-1) * k_x.unsqueeze(0) 
+        temp_y = y.unsqueeze(-1) * k_y.unsqueeze(0) 
+
+        exp_x = torch.exp(2j * math.pi * temp_x)
+        exp_y = torch.exp(2j * math.pi * temp_y)
+
+        temp_eta_y = torch.bmm(eta,exp_y.unsqueeze(-1)).squeeze(-1)
+
+        reconstructed = (torch.bmm(temp_eta_y.unsqueeze(1), exp_x.unsqueeze(-1))/math.prod(self.grid_size)).real
+
+        # z = (torch.sum(density,dim=(1,2))*((range_x_diff * range_y_diff)/math.prod(grid_size))).unsqueeze(-1).unsqueeze(-1)
+
+        result = -reconstructed + ln_z
+
+        # print("Integrating the distribution",torch.mean(torch.sum(density/z,dim=(1,2))*step_t[0]*step_t[1]))
+
+        return torch.mean(result.squeeze(-1))
 
     def normalization_constant(self,density):
-
         moments = torch.fft.fft2(density)
         z = (moments[:,0,0] * ((self.range_x_diff * self.range_y_diff) / math.prod(self.grid_size))).unsqueeze(-1).unsqueeze(-1)
         return z.real
+    
+    def normalization_constant_energy(self,energy):
+        # min_energy = torch.min(energy, dim=-1, keepdim=True).values
+        # min_min_energy = torch.min(min_energy, dim=1, keepdim=True).values
+        # print(min_min_energy)
+        moments = torch.fft.fft2(torch.exp(energy))
+        # print(moments.isnan().any())
+        z = torch.log((moments[:,0,0].real * ((self.range_x_diff * self.range_y_diff) / math.prod(self.grid_size))).unsqueeze(-1).unsqueeze(-1))
+        return z
     
     def pad_for_fft_2d(self,tensor, target_shape):
         pad_h = target_shape[0] - tensor.shape[1]

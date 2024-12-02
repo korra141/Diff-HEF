@@ -284,7 +284,7 @@ def main(args):
             # Forward pass
             energy = model(ground_truth)
             loss = loss_fn(energy, measurements, args.band_limit)
-            if i % 50 == 0 and epoch % args.log_freq == 0:
+            if i % 500 == 0 and epoch % args.log_freq == 0:
                 fig, ax = plt.subplots()
                 ax = plot_circular_distribution(energy[0],"predicted distribution",ax)
                 ax = plot_circular_distribution(energy_multimodal_gaussian(args, ground_truth[0]),"true distribution",ax)
@@ -301,8 +301,6 @@ def main(args):
             loss.backward()
             optimizer.step()
             loss_tot += loss.item()
-
-
 
 
         # if (i+1) % 10 == 0:

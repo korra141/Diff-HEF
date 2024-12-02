@@ -27,6 +27,11 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 from time import strftime, localtime
+import wandb
+import sys
+
+base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(base_path)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Experiment to learn the measurement distribution in S1 using Harmonic Exponential Functions.')
@@ -50,12 +55,12 @@ def parse_args():
 
 args = parse_args()
 
-def heteroscedastic_noise(x, min_noise, max_noise):
-   # Normalize x 
-   x = x % (2 * np.pi)
-   x = x / (2 * np.pi)
-   scale = x**2 / (x**2 + (1-x)**2)
-   return min_noise + scale * (max_noise - min_noise)
+# def heteroscedastic_noise(x, min_noise, max_noise):
+#    # Normalize x 
+#    x = x % (2 * np.pi)
+#    x = x / (2 * np.pi)
+#    scale = x**2 / (x**2 + (1-x)**2)
+#    return min_noise + scale * (max_noise - min_noise)
 
 
 def multimodal_gaussian_noise(args, x):
@@ -69,7 +74,6 @@ def multimodal_gaussian_noise(args, x):
   noise1 = np.random.normal(mean1, std1, n_samples)
   noise2 = np.random.normal(mean2, std2, n_samples)
   mask = np.random.binomial(1, args.bin_prob,  n_samples)
-
   return mask * noise1 + (1 - mask) * noise2
 
 def von_mises_density(x, mu, std):
@@ -81,18 +85,24 @@ def positive_angle(angle):
 # def normal_density(x, mean=0, std=1):
 #     return (1 / (np.sqrt(2 * np.pi * std**2))) * np.exp(-((x - mean)**2) / (2 * std**2))
 
+def von_mises_density(x, mu, std):
+  kappa = 1/(std **2)
+  return np.exp(kappa * np.cos(x - mu)) / (2 * np.pi * i0(kappa))
+
+def positive_angle(angle):
+    return (angle + 2 * np.pi) % (2 * np.pi)
 
 def energy_multimodal_gaussian(args, x):
    x = x.numpy()
    grid = np.linspace(0, 2 * np.pi, args.band_limit, endpoint=False)
-   density1 = von_mises_density(grid,  positive_angle(x-args.mean_offset / 2) , args.measurement_noise_min)
-   density2 = von_mises_density(grid,  positive_angle(x+args.mean_offset / 2) , args.measurement_noise_max)
+   density1 = von_mises_density(grid, positive_angle(x - args.mean_offset / 2), args.measurement_noise_min)
+   density2 = von_mises_density(grid, positive_angle(x + args.mean_offset / 2), args.measurement_noise_max)
    energy = np.log(args.bin_prob*density1 + (1-args.bin_prob)*density2)
    return torch.from_numpy(energy).type(torch.FloatTensor)
   
 
 
-def generating_data_S1(args, batch_size, n_samples, trajectory_length, measurement_noise, step=0.1, shuffle_flag=True):
+def generating_data_S1(args, base_path, batch_size, n_samples, trajectory_length, step=0.1, shuffle_flag=True):
   """Generates training data for a system with circular motion.
 
   Args:
@@ -106,28 +116,34 @@ def generating_data_S1(args, batch_size, n_samples, trajectory_length, measureme
   Returns:
     Flattened pose and noisy measurement data in a TensorDataset.
   """
+  data_path = os.path.join(base_path, f's1_toy_dataset_flattened_{n_samples * trajectory_length}_mm_noise{args.measurement_noise_min}_{args.measurement_noise_max}_step{step}.pt')
+  if not os.path.exists(data_path):
+    starting_positions = np.linspace(0, 2 * np.pi, n_samples, endpoint=False)
+    true_trajectories = np.ndarray((n_samples, trajectory_length))
+    measurements = np.ndarray((n_samples, trajectory_length))
+    for i in range(n_samples):
+      # Generate a circular trajectory with a random starting position.
+      initial_angle = starting_positions[i]
+      trajectory = initial_angle + np.arange(trajectory_length) * step
+      true_trajectories[i] = trajectory % (2 * np.pi)
 
-  starting_positions = np.linspace(0, 2 * np.pi, n_samples, endpoint=False)
-  true_trajectories = np.ndarray((n_samples, trajectory_length))
-  measurements = np.ndarray((n_samples, trajectory_length))
+      # Add Gaussian noise to the measurements.
+      noise = multimodal_gaussian_noise(args, trajectory)
+      
+      measurements[i] = (trajectory + noise) % (2 * np.pi)
 
-  for i in range(n_samples):
-    # Generate a circular trajectory with a random starting position.
-    initial_angle = starting_positions[i]
-    trajectory = initial_angle + np.arange(trajectory_length) * step
-    true_trajectories[i] = trajectory % (2 * np.pi)
-
-    # Add Gaussian noise to the measurements.
-    noise = multimodal_gaussian_noise(args, trajectory)
-    
-    measurements[i] = (trajectory + noise) % (2 * np.pi)
-
-  measurements_ = torch.from_numpy(measurements)
-  ground_truth_ = torch.from_numpy(true_trajectories)
-  ground_truth_flatten = torch.flatten(ground_truth_)[:, None].type(torch.FloatTensor)
-  measurements_flatten = torch.flatten(measurements_)[:, None].type(torch.FloatTensor)
-  train_dataset = torch.utils.data.TensorDataset(ground_truth_flatten, measurements_flatten)
+    measurements_ = torch.from_numpy(measurements)
+    ground_truth_ = torch.from_numpy(true_trajectories)
+    ground_truth_flatten = torch.flatten(ground_truth_)[:, None].type(torch.FloatTensor)
+    measurements_flatten = torch.flatten(measurements_)[:, None].type(torch.FloatTensor)
+    train_dataset = torch.utils.data.TensorDataset(ground_truth_flatten, measurements_flatten)
+    torch.save(train_dataset, data_path)
+  else:
+    print('Loading Data')
+    train_dataset = torch.load(data_path)
+  
   train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle_flag)
+
   return train_loader
 
 def loss_fn(energy, measurements, grid_size=20):
@@ -147,7 +163,7 @@ def loss_fn(energy, measurements, grid_size=20):
   eta = torch.fft.fftshift(torch.fft.fft(energy, dim=-1), dim=-1)
   maximum = torch.max(energy, dim=-1).values.unsqueeze(-1)
   moments = torch.fft.fft(torch.exp(energy - maximum), dim=-1)
-  ln_z_ = torch.log(moments[:, 0] / (math.pi * grid_size * math.pi / 62)).real.unsqueeze(-1) + maximum
+  ln_z_ = torch.log(2*math.pi* moments[:, 0] /grid_size).real.unsqueeze(-1) + maximum
 
   # taking inverse FFT over a set of frequencies ranging
   k_values = torch.arange(grid_size) - grid_size / 2
@@ -168,7 +184,7 @@ def plot_circular_distribution(energy_samples,legend="predicted",ax=None):
     grid_size = energy_samples.shape[0]
     maximum = torch.max(energy_samples).unsqueeze(-1)
     moments = torch.fft.fft(torch.exp(energy_samples - maximum), dim=-1)
-    ln_z_ = torch.log(2*math.pi* moments[0]/grid_size).real.unsqueeze(-1) + maximum
+    ln_z_ = torch.log(2*math.pi*moments[0] / grid_size).real.unsqueeze(-1) + maximum
     prob = torch.exp(energy_samples - ln_z_)
     prob = prob.detach()
 
@@ -258,8 +274,9 @@ class EnergyNetwork(nn.Module):
 def main(args):
 
     # Generate training data
-    train_loader =  generating_data_S1(args, args.batch_size, args.n_samples, args.trajectory_length, args.measurement_noise_min, args.step_size, True)
-    test_loader = generating_data_S1(args, args.batch_size, 20, args.trajectory_length, args.measurement_noise_min, args.step_size, False)
+    data_path =  os.path.join(base_path, 'data')
+    train_loader =  generating_data_S1(args, data_path, args.batch_size, args.n_samples, args.trajectory_length,  args.step_size, True)
+    # test_loader = generating_data_S1(args, args.batch_size, 20, args.trajectory_length, args.measurement_noise_min, args.step_size, False)
 
     # Initialize the model, optimizer, and loss function
     model = EnergyNetwork(1, args.hidden_size, args.band_limit)
@@ -268,7 +285,7 @@ def main(args):
     ctime = time.time()
     ctime = strftime('%Y-%m-%d %H:%M:%S', localtime(ctime))
 
-    os.makedirs(os.path.join(args.log_dir, str(ctime)))
+    os.makedirs(os.path.join(base_path, args.log_dir, str(ctime)))
 
 
     # Training loop
@@ -279,12 +296,11 @@ def main(args):
 
         loss_tot = 0
         for i, (ground_truth, measurements) in enumerate(train_loader):
-            # print(torch.cat([ground_truth, measurements], axis=-1))
-            # break
+            start_time = time.time()
             # Forward pass
             energy = model(ground_truth)
             loss = loss_fn(energy, measurements, args.band_limit)
-            if i % 500 == 0 and epoch % args.log_freq == 0:
+            if i  == 0 and epoch % args.log_freq == 0:
                 fig, ax = plt.subplots()
                 ax = plot_circular_distribution(energy[0],"predicted distribution",ax)
                 ax = plot_circular_distribution(energy_multimodal_gaussian(args, ground_truth[0]),"true distribution",ax)
@@ -292,7 +308,8 @@ def main(args):
                 ax.plot(torch.cos(ground_truth[0]), torch.sin(ground_truth[0]), 'o', label="pose data")
                 ax.set_title(f"Epoch {epoch,}", loc='center')
                 ax.legend(bbox_to_anchor=(0.85, 1), loc='upper left', fontsize='x-small')
-                plt.savefig(os.path.join(args.log_dir, f"{ctime}/{epoch}/iter {i}.png"), format='png', dpi=300)
+                plt.savefig(os.path.join(args.log_dir, f"{ctime}/{epoch}.png"), format='png', dpi=300)
+                wandb.log({rf"plot_{epoch}": wandb.Image(os.path.join(args.log_dir, f"{ctime}/{epoch}.png"))})
                 # plt.show()
                 plt.close()
 
@@ -305,16 +322,24 @@ def main(args):
 
         # if (i+1) % 10 == 0:
         loss_list.append(loss_tot/len(train_loader))
+        wandb.log({
+              'Epoch': epoch + 1,
+              'Train NLL loss': loss_tot / len(train_loader)
+        })
         print(f'Epoch [{epoch+1}/{args.num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss_tot/len(train_loader):.4f}')
-    plt.plot(range(args.num_epochs),loss_list)
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training Loss")
-    plt.savefig(os.path.join(args.log_dir, f"{ctime}/loss.png"), format='png', dpi=300)
-    plt.close()
+    # plt.plot(range(args.num_epochs),loss_list)
+    # plt.xlabel("Epoch")
+    # plt.ylabel("Loss")
+    # plt.title("Training Loss")
+    # plt.savefig(os.path.join(args.log_dir, f"{ctime}/loss.png"), format='png', dpi=300)
+    # plt.close()
     print("Training finished!")
 
 
 if __name__ == '__main__':
    args = parse_args()
+   wandb.init(mode="disabled",project="Diff-HEF",group="S1",entity="korra141",
+              tags=["S1","UncertainityEstimation","MultimodalNoise"],
+              name="S1-UncertainityEstimation",
+              config=args)
    main(args)

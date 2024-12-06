@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class DensityPredictorCNN(nn.Module):
     def __init__(self, input_dim, grid_size,batch_size):
@@ -15,9 +16,9 @@ class DensityPredictorCNN(nn.Module):
         self.input_padding = nn.ReplicationPad2d(1)
 
         # Convolutional layers for refinement
-        self.conv1 = nn.Conv2d(1, 1, kernel_size=3,padding=1)
-        self.conv2 = nn.Conv2d(1, 1, kernel_size=3,padding=1)
-        self.conv3 = nn.Conv2d(1, 1, kernel_size=3,padding=1)
+        self.conv1 = nn.Conv2d(1, 4, kernel_size=3,padding=1)
+        self.conv2 = nn.Conv2d(4, 4, kernel_size=3,padding=1)
+        self.conv3 = nn.Conv2d(4, 1, kernel_size=3,padding=1)
         self.batch_size = batch_size
 
     def forward(self, input):
@@ -97,6 +98,54 @@ class CNNModel_A(nn.Module):
         return torch.clamp(x, min=1e-10)
 
         
+class DensityPredictorMLPCNN(nn.Module):
+    def __init__(self, input_dim, grid_size,batch_size):
+        """
+        Args:
+            input_dim: Number of input features.
+            grid_size: Tuple (H, W) representing the dimensions of the grid.
+        """
+        super(DensityPredictorMLPCNN, self).__init__()
+        self.grid_size = grid_size
+
+        self.input_padding = nn.ReplicationPad2d(1)
+        self.linear1 = nn.Linear(input_dim, math.prod(grid_size)//2)
+        self.linear2 = nn.Linear(math.prod(grid_size)//2, math.prod(grid_size))
+
+        # Convolutional layers for refinement
+        self.conv1 = nn.Conv2d(1, 1, kernel_size=3,padding=1)
+        # self.conv2 = nn.Conv2d(4, 4, kernel_size=3,padding=1)
+        self.conv3 = nn.Conv2d(1, 1, kernel_size=3,padding=1)
+        self.batch_size = batch_size
+
+    def forward(self, input):
+
+        # Convolutional layers
+        x = F.relu(self.linear1(input))
+        x = F.relu(self.linear2(x))
+        x = x.view(self.batch_size, 1, *self.grid_size)
+        x = self.input_padding(x)
+        x = F.relu(self.conv1(x))
+        # x = F.relu(self.conv2(x))
+        x = self.conv3(x)
+        x = F.relu(x.squeeze(1))
+        x = x[:,1:1+self.grid_size[0], 1:1+self.grid_size[1]]
+
+        return torch.clamp(x,min=1e-10)
+
+def init_weights(model):
+  for layer in model.modules():
+    initialize_conv_to_not_zero(layer)
+
+def initialize_weights(module):
+    if isinstance(module, torch.nn.Linear):
+        torch.nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
+        if module.bias is not None:
+            torch.nn.init.zeros_(module.bias)
+    elif isinstance(module, torch.nn.Conv2d):
+        torch.nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
+        if module.bias is not None:
+            torch.nn.init.zeros_(module.bias)
 
 
 def init_weights_identity(model):

@@ -22,7 +22,7 @@ class NeuralNetwork(nn.Module):
         x = x.view(-1, self.band_limit_x, self.band_limit_y)
         return torch.clamp(-x,min=-10) + input_energy
 
-def init_weights(m):
+def init_weights_mlp(m):
         if isinstance(m, nn.Linear):
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)

@@ -11,6 +11,11 @@ wandb/
 logs/
 scripts/logs/
 scripts/UE_R2/logs/
+scripts/wandb/
+scripts/UE_R2/wandb/
+data/
+slurm_logs/
+sbatch*
 # Distribution / packaging
 .Python
 build/

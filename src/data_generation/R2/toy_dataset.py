@@ -18,7 +18,6 @@ class TrajectoryGenerator:
         weights = np.ones(self.n_modes) / self.n_modes
         selected_mode = np.random.choice(range(self.n_modes), p=weights)
         noise_point = np.random.normal(loc=mean[selected_mode], scale=std[selected_mode], size=(n_samples))
-        # print(noise_point)
         return noise_point
 
     def generate_multimodal_trajectories(self):

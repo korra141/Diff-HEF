@@ -33,8 +33,8 @@ def validate_model(model, data_loader, hed, band_limit, range_x, range_y, measur
     val_true_nll_tot = 0
     for val_batch_idx, (val_ground_truth, val_measurements) in enumerate(data_loader):
       print(f"Validation Batch: {val_batch_idx}")
-      input_pose_pdf = GaussianDistribution(val_ground_truth,initial_noise,range_x,range_y,band_limit)
-      target_distribution = GaussianDistribution(val_ground_truth,measurement_noise,range_x,range_y,band_limit)
+      input_pose_pdf = GaussianDistribution(val_ground_truth,initial_noise,band_limit,range_x,range_y)
+      target_distribution = GaussianDistribution(val_ground_truth,measurement_noise,band_limit,range_x,range_y)
 
       val_input_pose_density = input_pose_pdf.density_over_grid()
       val_outputs = model(val_input_pose_density)
@@ -98,7 +98,7 @@ def main(args):
   log_dir = os.path.join("logs", run_name, current_datetime)
   os.makedirs(log_dir, exist_ok=True)
 
-  hed = HarmonicExponentialDistribution(range_x,range_y,band_limit,step_t)
+  hed = HarmonicExponentialDistribution(band_limit,step_t,range_x,range_y)
   batch_step = 0
   # Training loop
   for epoch in range(num_epochs):
@@ -120,7 +120,7 @@ def main(args):
     for batch_idx, (ground_truth, measurements) in enumerate(train_loader):
 
       check_model_weights_nan(model)
-      input_pose_pdf = GaussianDistribution(ground_truth,initial_noise,range_x,range_y,band_limit)
+      input_pose_pdf = GaussianDistribution(ground_truth,initial_noise,band_limit,range_x,range_y)
       input_pose_density = input_pose_pdf.density_over_grid()
       outputs = model(input_pose_density)
       check_tensor_nan(outputs)
@@ -133,7 +133,7 @@ def main(args):
     
       loss = hed.negative_log_likelihood_density(predicted_density, measurements)
 
-      target_distribution = GaussianDistribution(ground_truth,measurement_noise,range_x,range_y,band_limit)
+      target_distribution = GaussianDistribution(ground_truth,measurement_noise,band_limit,range_x,range_y)
       true_nll_input = target_distribution.negative_log_likelihood(measurements)
       true_density = target_distribution.density_over_grid()
 

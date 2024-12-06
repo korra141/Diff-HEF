@@ -17,11 +17,11 @@ import argparse
 import wandb
 import sys
 
-base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(base_path)
 
 # local import 
-from src.utils.visualisation import plot_3d,plot_3d_density
+from src.utils.visualisation import plot_density
 from src.distributions.R2.HarmonicExponentialDistribution import HarmonicExponentialDistribution
 from src.distributions.R2.StandardDistribution import MultiModalGaussianDistribution, GaussianDistribution
 from src.utils.debug_tools import check_model_weights_nan, check_tensor_nan, get_gradients
@@ -86,7 +86,8 @@ def main(args):
   batch_size = args.batch_size
   learning_rate = args.learning_rate
   num_epochs = args.num_epochs
-
+  lambda_scheduler = lambda epoch: args.start_lambda + (args.end_lambda - args.start_lambda) * (1 - torch.exp(torch.tensor(-args.reg_factor * epoch / num_epochs)))
+  
   data_path = os.path.join(base_path, 'data')
   data_generator = TrajectoryGenerator(range_x, range_y, step_t, n_samples , trajectory_length, measurement_noise, mean_offset, n_modes)
   train_loader, val_loader = data_generator.create_data_loaders(data_path, batch_size,flag_flattend=True)
@@ -111,7 +112,7 @@ def main(args):
 
   centers = torch.tile(torch.linspace(-mean_offset / 2, mean_offset / 2, n_modes)[None,:,None], (batch_size, 1, 2)) # n_modes
       
-  hed = HarmonicExponentialDistribution(range_x,range_y,band_limit,step_t)
+  hed = HarmonicExponentialDistribution(band_limit,step_t,range_x,range_y)
   batch_step = 0
   for epoch in range(num_epochs):
     loss_tot = 0
@@ -124,17 +125,18 @@ def main(args):
     # val_dict = validate_model(model, val_loader, hed, band_limit, range_x, range_y, measurement_noise, initial_noise,args.delta,centers,n_modes)
     # val_dict['Epoch'] = epoch + 1
     
-    if args.decay_lr and epoch % 1  == 0:
-      learning_rate_decay = learning_rate * (0.8 ** epoch)
-      print(learning_rate_decay)
+    if args.decay_lr:
+      learning_rate_decay = args.learning_rate_start + (args.learning_rate_end - args.learning_rate_start) * (1 - np.exp((-args.lr_factor * epoch / num_epochs)))
+      print("learning_rate",learning_rate_decay)
       for param_group in optimizer.param_groups:
         param_group['lr'] = learning_rate_decay
+    lambda_ = lambda_scheduler(epoch)
     # wandb.log(val_dict)
     print(f"Training Epoch: {epoch + 1}")
     for batch_idx, (ground_truth, measurements) in enumerate(train_loader):
       start_time = datetime.datetime.now()
       check_model_weights_nan(model)
-      input_pose_pdf = GaussianDistribution(ground_truth,initial_noise,range_x,range_y,band_limit)
+      input_pose_pdf = GaussianDistribution(ground_truth,initial_noise,band_limit,range_x,range_y)
       input_pose_density = input_pose_pdf.density_over_grid()
       outputs = model(input_pose_density)
       check_tensor_nan(outputs)
@@ -142,13 +144,10 @@ def main(args):
       check_tensor_nan(z)
       outputs = outputs/z
       predicted_density = outputs
-      hef_loss_input = hed.negative_log_likelihood_density(input_pose_density,measurements)
-      initial_nll = input_pose_pdf.negative_log_likelihood(measurements)
-    
       # loss = hed.negative_log_likelihood_density(predicted_density, measurements)
-      loss = hed.loss_energy(predicted_density, measurements)
+      loss = hed.loss_regularisation_norm(lambda_, predicted_density, measurements)
       mm_mean = ground_truth.unsqueeze(1) + centers #(batch_size, n_modes, 2)
-      target_distribution = MultiModalGaussianDistribution(mm_mean,measurement_noise,range_x,range_y,band_limit,n_modes)
+      target_distribution = MultiModalGaussianDistribution(mm_mean,measurement_noise,band_limit,n_modes,range_x,range_y)
       true_nll_input = target_distribution.negative_log_likelihood(measurements)
       true_density = target_distribution.density_over_grid()
 
@@ -166,18 +165,16 @@ def main(args):
       loss_tot +=loss.item()
       kl_2_tot += kl_div_2.item()
       true_nll_tot += true_nll_input.item()
-      initial_nll_temp += initial_nll.item()
-      hef_loss_temp +=hef_loss_input.item()
+      # initial_nll_temp += initial_nll.item()
+      # hef_loss_temp +=hef_loss_input.item()
       # print(f'batch: {batch_step}, Train batch NL Loss: {loss.item()}, Train batch KL Div 2: {kl_div_2.item()}, time: {datetime.datetime.now() - start_time}')
     
       # wandb.log({'batch': batch_step, 'Train batch NL Loss': loss.item(), 'Train batch KL Div 2': kl_div_2.item()})
       batch_step += 1
       
       if batch_idx==0 and epoch % 10 == 0:
-        epoch_dir = log_dir + f"/epoch_{epoch}"
-        os.makedirs(epoch_dir, exist_ok=True)
         dict_density = {"true_density": true_density[sample_idx], "predicted_density": predicted_density[sample_idx], "input_density": input_pose_density[sample_idx]}
-        plot_3d_density(ground_truth[sample_idx],measurements[sample_idx],range_x,range_y,band_limit,epoch_dir, dict_density,"Uncertainity Estimation in R2 MM")
+        plot_density(ground_truth[sample_idx],measurements[sample_idx],range_x,range_y,log_dir,epoch, dict_density,"Uncertainity Estimation in R2 MM")
     wandb.log({
               'Epoch': epoch + 1,
               'Train NLL loss': loss_tot / len(train_loader),
@@ -189,11 +186,9 @@ def main(args):
               'IUR Input NLL' : hef_loss_temp/len(train_loader)
               })
   print("Training Completed")
-  for epoch_folder in os.listdir(log_dir):
-    epoch_folder_path = os.path.join(log_dir, epoch_folder)
-    if os.path.isdir(epoch_folder_path):
-      wandb.log({rf"plot3d_{epoch}": wandb.Image(os.path.join(epoch_folder_path, "plot3d.png"))})
-      wandb.log({rf"plot2d_{epoch}": wandb.Image(os.path.join(epoch_folder_path, "2d_plots.png"))})
+  for img_file in os.listdir(log_dir):
+      if img_file.endswith(".png"):
+        wandb.log({img_file: wandb.Image(os.path.join(log_dir, img_file))})
   wandb.finish()
 
 if __name__ == "__main__":
@@ -216,7 +211,13 @@ if __name__ == "__main__":
   parser.add_argument('--delta', type=int, default=0, help='output delta density')
   parser.add_argument('--n_modes', type=int, default=2, help='Number of modes for the Gaussian distribution')
   parser.add_argument('--mean_offset', type=float, default=0.2, help='Mean offset for the Gaussian distribution')
-
+  parser.add_argument('--start_lambda', type=float, default=0.1, help='Starting value of lambda for regularization')
+  parser.add_argument('--end_lambda', type=float, default=50, help='Ending value of lambda for regularization')
+  parser.add_argument('--reg_factor', type=float, default=5, help='Regularization factor for lambda scheduler')
+  parser.add_argument('--learning_rate_start', type=float, default=0.001, help='Starting learning rate for decay')
+  parser.add_argument('--learning_rate_end', type=float, default=0.0001, help='Ending learning rate for decay')
+  parser.add_argument('--lr_factor', type=float, default=20, help='Factor for learning rate adjustment')
+ 
   args = parser.parse_args()
   band_limit = [int(x) for x in args.band_limit.split()]
   args.band_limit = band_limit

@@ -5,13 +5,30 @@ import numpy as np
 import pdb
 
 class HarmonicExponentialDistribution:
-    def __init__(self, range_x, range_y, bandwidth, step_size):
+    def __init__(self, bandwidth, step_size,range_x=None, range_y=None, range_x_diff=None,range_y_diff=None):
         self.range_x = range_x
         self.range_y = range_y
         self.grid_size = bandwidth
         self.step_t = step_size
-        self.range_x_diff = self.range_x[1] - self.range_x[0]
-        self.range_y_diff = self.range_y[1] - self.range_y[0]
+        if range_x_diff is None:
+            self.range_x_diff = self.range_x[1] - self.range_x[0]
+        else:
+            self.range_x_diff = range_x_diff
+        if range_y_diff is None:
+            self.range_y_diff = self.range_y[1] - self.range_y[0]
+        else:
+            self.range_y_diff = range_y_diff
+
+    def loss_regularisation_norm(self,lambda_,density,value,mean=None,scaling_factor=1):
+        if mean is None:
+            NLL = self.loss_energy(density,value)
+        else:
+            NLL = self.negative_log_likelihood_local_grid(density,value,mean)
+        grid_norm = torch.norm(density, p=1, dim=(1,2), keepdim=False, out=None)
+        max = torch.max(grid_norm)  
+        grid_norm = (grid_norm/max)*scaling_factor
+        return torch.mean(NLL - lambda_ * grid_norm)
+
 
     def negative_log_likelihood_density(self,density,value):
         """
@@ -57,6 +74,50 @@ class HarmonicExponentialDistribution:
         # print("Integrating the distribution",torch.mean(torch.sum(density/z,dim=(1,2))*step_t[0]*step_t[1]))
 
         return torch.mean(result.squeeze(-1))
+    
+    def negative_log_likelihood_local_grid(self, density,value,mean):
+        """
+        Computes the negative log-likelihood density for a given density and value.
+        Args:
+            density (torch.Tensor): The density tensor of shape [batchsize, grid_size1, grid_size2].
+            value (torch.Tensor): The value tensor of shape [batchsize, 2], where each row represents a point (x, y).
+        Returns:
+            torch.Tensor: The mean negative log-likelihood density.
+        Note:
+            The value should lie on the grid. If it does not, this function will output an incorrect value since it does not use an interpolator.
+        """
+
+        # It is more numerically stable to compute the log of the density and then exponentiate it.
+
+        energy = torch.log(density + 1e-40)
+
+        ln_z = self.normalization_constant_energy(energy)
+
+        eta = torch.fft.fft2(energy) #[batchsize,grid_size1, grid_size2]
+
+        k_x = torch.arange(self.grid_size[0])
+        k_y = torch.arange(self.grid_size[1])
+
+        x = (value[:,0] - mean[:,0] + self.range_x_diff/2)/self.range_x_diff
+        y = (value[:,1] - mean[:,1] + self.range_y_diff/2)/self.range_y_diff
+
+        temp_x = x.unsqueeze(-1) * k_x.unsqueeze(0)
+        temp_y = y.unsqueeze(-1) * k_y.unsqueeze(0)
+
+        exp_x = torch.exp(2j * math.pi * temp_x).unsqueeze(-1)
+        exp_y = torch.exp(2j * math.pi * temp_y).unsqueeze(1)
+
+        exp_x_y = torch.bmm(exp_x,exp_y)
+
+        reconstructed = ((eta * exp_x_y).sum(dim=1).sum(1) / math.prod(self.grid_size)).real
+        # print(reconstructed.shape)
+
+        # temp_eta_y = torch.bmm(eta,exp_y.unsqueeze(-1)).squeeze(-1)
+
+        # reconstructed = (torch.bmm(temp_eta_y.unsqueeze(1), exp_x.unsqueeze(-1))/math.prod(grid_size)).real
+
+        result = -reconstructed + ln_z
+        return result
     
     def loss_energy(self,density,value):
         """
@@ -155,9 +216,16 @@ class HarmonicExponentialDistribution:
 
         # Step 4: Stack the coordinates to get the final shape (10, 2)
         mode_idx = torch.stack((max_x, max_y), dim=1) 
+
+        if self.range_x is None and self.range_y is None:
+            min_x = self.range_x_diff/2
+            min_y = self.range_x_diff/2
+        else:
+            min_x = self.range_x[0]
+            min_y = self.range_y[0]
     
-        poses_mode_x = mode_idx[:, 0] * self.step_t[0] + self.range_x[0]
-        poses_mode_y = mode_idx[:, 1] * self.step_t[1] + self.range_y[0]
+        poses_mode_x = mode_idx[:, 0] * self.step_t[0] + min_x
+        poses_mode_y = mode_idx[:, 1] * self.step_t[1] + min_y
         poses_mode = torch.stack((poses_mode_x, poses_mode_y), dim=-1)
 
         return poses_mode

@@ -42,7 +42,7 @@ def generating_data_S1_unimodal(base_path,batch_size, n_samples, trajectory_leng
     else:
         print('Loading Data')
         train_dataset = torch.load(data_path)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle_flag)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, drop_last=True, shuffle=shuffle_flag)
     return train_loader
 
 def heteroscedastic_noise(x, min_noise, max_noise):
@@ -94,7 +94,7 @@ def generating_data_S1_heteroscedastic(base_path, args, batch_size, n_samples, t
         print('Loading Data')
         train_dataset = torch.load(data_path)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle_flag)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, drop_last=True, shuffle=shuffle_flag)
     return train_loader
 
 
@@ -149,6 +149,6 @@ def generating_data_S1_multimodal(measurement_noise, mean_offset,n_modes,base_pa
     print('Loading Data')
     train_dataset = torch.load(data_path)
   
-  train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle_flag)
+  train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, drop_last=True, shuffle=shuffle_flag)
 
   return train_loader

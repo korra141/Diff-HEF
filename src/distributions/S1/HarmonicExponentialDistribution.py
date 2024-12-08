@@ -6,9 +6,11 @@ import pdb
 
 class HarmonicExponentialDistribution:
     def __init__(self, bandwidth,range_theta=None):
+        self.range_theta = range_theta if range_theta is not None else 2 * math.pi
         if range_theta is None:
-            range_theta = 2*math.pi
-        self.range_theta = range_theta
+            self.local_grid = True
+        else:
+            self.local_grid = False
         self.grid_size = bandwidth
 
     def negative_log_likelihood(self,energy, measurements):
@@ -71,3 +73,15 @@ class HarmonicExponentialDistribution:
         moments = torch.fft.fft(torch.exp(energy - maximum), dim=-1)
         ln_z_ = torch.log(self.range_theta * moments[:, 0] / self.grid_size).real.unsqueeze(-1) + maximum
         return ln_z_
+    
+    def mode(self,predicted_density,ground_truth):
+        # Step 1: Get the maximum values and their indices along the last dimension (dim=-1)
+        max_vals, max_indices = torch.max(predicted_density, dim=-1)  # max over columns, shape (batch_size,)
+
+        # Step 2: Get the indices of the maximum values along the last dimension (dim=-1)
+        if self.local_grid:
+            poses_mode = (self.range_theta * max_indices / self.grid_size) + ground_truth  - self.range_theta/2
+        else:
+            poses_mode = (self.range_theta  * max_indices / self.grid_size)
+
+        return poses_mode

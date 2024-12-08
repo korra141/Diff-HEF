@@ -16,3 +16,4 @@ def get_gradients(model):
 def check_tensor_nan(tensor):
     if torch.isnan(tensor).any():
         print("Tensor contains NaN values.")
+        

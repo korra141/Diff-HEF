@@ -6,8 +6,8 @@ import numpy as np
 
 class VonMissesDistribution:
     def __init__(self, mean, std, band_limit):
-        self.mean = mean.numpy()
-        self.std = std.numpy()
+        self.mean = mean
+        self.std = std
         self.band_limit = band_limit
         self.batch_size = mean.shape[0]
 
@@ -24,24 +24,70 @@ class VonMissesDistribution:
         kappa = 1/(self.std **2)
         density = np.exp(kappa * np.cos(grid)) / (2 * math.pi * i0(kappa))
         return torch.tensor(density).type(torch.FloatTensor)
-
+    
+    def energy(self):
+        grid = np.tile(np.linspace(0, 2*math.pi, self.band_limit +1)[:-1][None, :], (self.batch_size, 1))
+        kappa = 1/(self.std **2)
+        energy = kappa * np.cos(grid - self.mean)
+        return torch.tensor(energy).type(torch.FloatTensor)
+    
+class VonMissesDistribution_torch:
+    def __init__(self, mean, cov, band_limit):
+        self.mean = mean
+        self.cov = cov
+        self.band_limit = band_limit
+        self.batch_size = mean.shape[0]
+    
+    def safe_i0(self, kappa):
+      """
+      Compute the modified Bessel function of the first kind, I_0(kappa),
+      with a safe approach for large kappa values.
+      """
+      if torch.max(kappa) > 40:  # Handle large values
+          return torch.exp(kappa - torch.log(2 * math.pi * kappa) / 2)  
+      return torch.special.i0(kappa)
+    
+    def energy(self):
+        grid = torch.tile(torch.linspace(0, 2*math.pi, self.band_limit+1)[:-1][None,:],(self.batch_size, 1))
+        kappa = 1/(self.cov)
+        energy = kappa * torch.cos(grid - self.mean)
+        return energy.type(torch.FloatTensor)
+    
+    def negative_loglikelihood(self,value):
+        kappa = 1/(self.cov)
+        if torch.any(torch.isnan(self.safe_i0(kappa))):
+            print("torch bessel is nan")
+        return torch.mean(- kappa * torch.cos(value - self.mean) + torch.log(2*math.pi*self.safe_i0(kappa)))
+    
+    def density(self):
+        grid = torch.tile(torch.linspace(0, 2*math.pi, self.band_limit+1)[:-1][None,:],(self.batch_size, 1))
+        kappa = (1/(self.cov))
+        mean = self.mean
+        density = torch.exp(kappa * torch.cos(grid - mean)) / (2 * math.pi * self.safe_i0(kappa))
+        return density
+    
+    def density_value(self,value):
+        # grid = torch.tile(torch.linspace(0, 2*math.pi, self.band_limit+1)[:-1][None,:],(self.batch_size, 1))
+        kappa = (1/(self.cov))
+        density = torch.exp(kappa * torch.cos(value - self.mean)) / (2 * math.pi * self.safe_i0(kappa))
+        return density
 
 
 class MultimodalGaussianDistribution:
-    def __init__(self, means, stds, n_modes,band_limit):
-        self.means = means
+    def __init__(self, means, stds, weights, n_modes,band_limit):
+        self.means = means.numpy()
         self.batch_size = means.shape[0]
-        self.stds = stds
+        self.stds = stds.detach().numpy()
         self.n_modes = n_modes
         self.band_limit = band_limit
-        self.weights = torch.ones(n_modes) / n_modes
+        self.weights = weights
 
     def energy(self):
         energy = torch.zeros((self.batch_size, self.band_limit))
         for i in range(self.n_modes):
             vmd = VonMissesDistribution(self.means[:,i], self.stds[i],self.band_limit)
             energy += self.weights[i]*vmd.density()
-        return torch.log(energy).type(torch.FloatTensor)  
+        return torch.log(torch.clamp(energy, min=1e-10)).type(torch.FloatTensor)
     
     def density(self):
         density = torch.zeros((self.batch_size, self.band_limit))
@@ -57,3 +103,35 @@ class MultimodalGaussianDistribution:
             vmd = VonMissesDistribution(self.means[:,i], self.stds[i],self.band_limit)
             density += self.weights[i]*vmd.density_local(range_theta)
         return density.type(torch.FloatTensor)  
+    
+class MultimodalGaussianDistribution_torch:
+    def __init__(self, means, covs, pi, n_modes, band_limit):
+        self.means = means
+        self.batch_size = means.shape[0]
+        self.covs = covs
+        self.n_modes = n_modes
+        self.band_limit = band_limit
+        # self.weights = torch.ones(n_modes) / n_modes
+        self.weights = pi #[batch_size, n_modes]
+
+    def energy(self):
+        energy = torch.zeros((self.batch_size, self.band_limit))
+        for i in range(self.n_modes):
+            vmd = VonMissesDistribution_torch(self.means[:, i:i+1], self.covs[:,i:i+1], self.band_limit)
+            energy += self.weights[:,i:i+1] * vmd.density()
+        return torch.log(torch.clamp(energy,min=1e-10)).type(torch.FloatTensor)
+
+    def density(self):
+        density = torch.zeros((self.batch_size, self.band_limit))
+        for i in range(self.n_modes):
+            vmd = VonMissesDistribution_torch(self.means[:, i:i+1], self.covs[:,i:i+1], self.band_limit)
+            density += self.weights[:,i:i+1] * vmd.density()
+        return density.type(torch.FloatTensor)
+    
+    def negative_loglikelihood(self, value):
+        density = torch.zeros((self.batch_size,1))
+        for i in range(self.n_modes):
+            vmd = VonMissesDistribution_torch(self.means[:, i:i+1], self.covs[:,i:i+1], self.band_limit)
+            density += self.weights[:,i:i+1] * vmd.density_value(value)
+        
+        return torch.mean(-torch.log(torch.clamp(density,min=1e-10))).type(torch.FloatTensor)

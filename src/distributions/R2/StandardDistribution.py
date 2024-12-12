@@ -4,9 +4,9 @@ import math
 import pdb
 
 class GaussianDistribution:
-    def __init__(self, mean, std, band_limit ,x_range=None, y_range=None,range_x_diff=None,range_y_diff=None):
+    def __init__(self, mean, cov, band_limit ,x_range=None, y_range=None,range_x_diff=None,range_y_diff=None):
         self.mean = mean
-        self.std = std
+        self.cov = cov
         self.band_limit = band_limit
         if x_range is not None and y_range is not None:    
             self.x_range = x_range
@@ -20,8 +20,8 @@ class GaussianDistribution:
 
     def negative_log_likelihood(self, value):
         # x, y = np.meshgrid(self.x_range, self.y_range)
-        exponent = -((value[:,0:1] - self.mean[:, 0:1])**2 / (2 * self.std**2)) - ((value[:,1:2] - self.mean[:, 1:2])**2 / (2 * self.std**2))
-        normalization = torch.tensor(2*math.pi*(self.std**2))
+        exponent = -((value[:,0:1] - self.mean[:, 0:1])**2 / (2 * self.cov[:,0:1])) - ((value[:,1:2] - self.mean[:, 1:2])**2 / (2 * self.cov[:,1:2]))
+        normalization = torch.tensor(2*math.pi*(torch.norm(self.cov)))
         return torch.mean(-exponent + torch.log(normalization))
 
 
@@ -37,8 +37,8 @@ class GaussianDistribution:
         x = torch.tile(x.unsqueeze(0),(n_traj,1,1))  # Add batch dimension
         y = torch.tile(y.unsqueeze(0),(n_traj,1,1))
         # Calculate the true unnormalized density for each ground truth point in the batch
-        exponent =  -((x - self.mean[:, 0:1, None])**2 / (2 * self.std**2)) - ((y - self.mean[:, 1:2, None])**2 / (2 * self.std**2))
-        normalization = torch.tensor(2*math.pi*(self.std**2))
+        exponent =  -((x - self.mean[:, 0:1, None])**2 / (2 * self.cov[:,0:1])) - ((y - self.mean[:, 1:2, None])**2 / (2 * self.cov[:,1:2]))
+        normalization = torch.tensor(2*math.pi*(torch.norm(self.cov)))
 
         return torch.exp(exponent)/normalization
     
@@ -54,8 +54,8 @@ class GaussianDistribution:
         y = torch.tile(y.unsqueeze(0),(n_traj,1,1))
 
         # Calculate the true unnormalized density for each ground truth point in the batch
-        exponent =  -((x)**2 / (2 * self.std **2 )) - ((y)**2 / (2 * self.std **2 ))
-        normalization = torch.tensor(2*math.pi*(self.std **2 ))
+        exponent =  -((x)**2 / (2 * self.cov[:,0:1,None] )) - ((y)**2 / (2 * self.cov[:,1:2,None]))
+        normalization = torch.tensor(2*math.pi*(torch.norm(self.cov )))
         return torch.exp(exponent)/normalization
 
     def energy_over_grid(self):
@@ -71,8 +71,8 @@ class GaussianDistribution:
         y = torch.tile(y.unsqueeze(0),(n_traj,1,1))
 
         # Calculate the true unnormalized density for each ground truth point in the batch
-        exponent =  -((x - self.mean[:, 0:1, None])**2 / (2 * self.std**2)) - ((y - self.mean[:, 1:2, None])**2 / (2 * self.std**2))
-        normalization = torch.tensor(2*math.pi*(self.std**2))
+        exponent =  -((x - self.mean[:, 0:1, None])**2 / (2 * self.cov[:,0:1,None])) - ((y - self.mean[:, 1:2, None])**2 / (2 * self.cov[:,1:2,None]))
+        normalization = torch.tensor(2*math.pi*(torch.norm(self.cov)))
 
         return exponent - torch.log(normalization)
     

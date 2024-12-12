@@ -7,6 +7,7 @@ import os
 import imageio
 import re
 import pdb
+from scipy.stats import beta as beta_dist
 
 def fit_grid_into_larger(mean, range_x_diff, range_y_diff, band_limit, output_density):
     """
@@ -191,6 +192,35 @@ def plot_s1_energy(energy_samples_list,
         f.append(prob)
     return plot_s1_func(f, legend, ax, plot_type)
 
+def plot_beta_distribution(alpha, beta, grid_size, ax, legend):
+  """
+  Plots a beta distribution on a circle.
+
+  Args:
+    alpha (float): Alpha parameter of the beta distribution.
+    beta (float): Beta parameter of the beta distribution.
+    grid_size (int): Number of points to plot.
+    ax (matplotlib.axes.Axes): The axes to plot on.
+    legend (str): Legend label for the plot.
+  """
+
+  theta = np.linspace(0, 2 * np.pi, grid_size, endpoint=False)
+  beta_pdf = beta_dist.pdf(theta/(2 * np.pi), alpha, beta)
+  radius = 1.0
+
+  prob_grid_r = beta_pdf + radius
+
+  a = radius * np.cos(theta)
+  b = radius * np.sin(theta)
+
+  prob_grid_x = np.cos(theta) * prob_grid_r
+  prob_grid_y = np.sin(theta) * prob_grid_r
+
+  ax.plot(a, b)
+  ax.plot(prob_grid_x, prob_grid_y, label=legend)
+  ax.legend()
+
+  return ax
 def plotting_von_mises(mu,cov,grid_size,ax,legend):
 
     # pdb.set_trace()
@@ -254,12 +284,12 @@ def generate_gif(image_folder, gif_name,prefix=None,duration=1):
 #     plt.savefig(folder_path + f"/hef_2d_plots.png")
 #   plt.close()
 
-def plot_density(ground_truth,measurement,range_x,range_y,folder_path,epoch,dict_density,title,iter=None):
+def plot_density(ground_truth,measurement,range_x,range_y,folder_path,dict_density,title,iter=None):
 
   values = list(dict_density.values())
   keys = list(dict_density.keys())
   # True and Predicted density
-  plot_3d_density(range_x,range_y,values[0].detach(), values[1].detach(),epoch,folder_path)
+  plot_3d_density(range_x,range_y,values[0].detach(), values[1].detach(),folder_path,title)
 
   num_plots = len(values)
   num_rows = int(math.ceil(math.sqrt(num_plots)))
@@ -279,9 +309,9 @@ def plot_density(ground_truth,measurement,range_x,range_y,folder_path,epoch,dict
   plt.tight_layout()
   fig.suptitle(title)
   if iter is not None:
-    plt.savefig(folder_path + f"/2d_plots_{epoch}_{iter}.png",dpi=100)
+    plt.savefig(folder_path + f"/2d_plots_{title}_{iter}.png",dpi=100)
   else:
-    plt.savefig(folder_path + f"/2d_plots_{epoch}.png",dpi=100)
+    plt.savefig(folder_path + f"/2d_plots_{title}.png",dpi=100)
   plt.close()
 
 def histogram_density(measurements_2d, pose_2d, normalised_density, legend, ax):
@@ -295,7 +325,7 @@ def histogram_density(measurements_2d, pose_2d, normalised_density, legend, ax):
   ax.legend()
   plt.colorbar(im, ax=ax, label='Density')
 
-def plot_3d_density(range_x,range_y,true_density,predicted_density,epoch,folder_path,traj_iter=None):
+def plot_3d_density(range_x,range_y,true_density,predicted_density,folder_path,title,traj_iter=None):
   fig, axs = plt.subplots(2, figsize=(8, 8),subplot_kw={'projection': '3d'})
 
   n_samples_x, n_samples_y = true_density.shape
@@ -320,15 +350,16 @@ def plot_3d_density(range_x,range_y,true_density,predicted_density,epoch,folder_
   axs[0].set_zlabel('True distribution')
 
   # Add a color bar to show the values of z
-  fig.colorbar(temp, ax=axs[0], shrink=0.5, aspect=5)
-  fig.colorbar(temp_1, ax=axs[0], shrink=0.5, aspect=5)
+  fig.colorbar(temp, ax=axs[1], shrink=0.5, aspect=5,anchor=(0.5, 0.5))
+  fig.colorbar(temp_1, ax=axs[0], shrink=0.5, aspect=5, anchor=(0.5, 0.5))
   
 
   if traj_iter is not None:
     fig.suptitle(f"Learning Filter Trajectory {traj_iter}")
-    plt.savefig(folder_path + f"/plot3d_epoch_{epoch}_{traj_iter}.png")
+    plt.savefig(folder_path + f"/plot3d_{title}_{traj_iter}.png")
   else:
-    plt.savefig(folder_path + f"/plot3d_epoch_{epoch}.png")
+    fig.suptitle(f"plot 3d {title}")
+    plt.savefig(folder_path + f"/plot3d_{title}.png")
   plt.close()
 
 def plot_gaussian_energy(energy):

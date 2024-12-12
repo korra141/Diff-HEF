@@ -1,5 +1,6 @@
 import torch
 import pdb
+import math
 
 def kl_divergence( p, q):
 
@@ -23,12 +24,23 @@ def kl_divergence_s1( p, q):
     q = torch.clamp(q, min=epsilon)
     return abs(torch.mean(torch.sum(p * torch.log(p / q),dim=-1)))
 
+def absolute_error_s1(p,q):
+    """
+    Calculate the Absolute Error between two distributions p and q.
+    Both p and q should be torch tensors of the same shape.
+    """
+    error = abs(p - q)
+    stacked_tensors = torch.stack((error, torch.ones_like(error)*2*math.pi - error), dim=-1)
+    # Find the minimum values across the last dimension
+    min_values, min_indices = torch.min(stacked_tensors, dim=-1)
+    return min_values
 def mean_absolute_error(p, q):
     """
     Calculate the Mean Absolute Error (MAE) between two tensors p and q.
     Both p and q should be torch tensors of the same shape.
     """
-    return torch.mean(torch.abs(p - q))
+    min_values = absolute_error_s1(p, q)
+    return torch.mean(min_values)
 
 def root_mean_square_error(p, q):
     """
@@ -43,7 +55,8 @@ def root_mean_square_error_s1(p, q):
     Calculate the Root Mean Square Error (RMSE) between two tensors p and q.
     Both p and q should be torch tensors of the same shape.
     """
-    return torch.mean(torch.sqrt(torch.mean((p - q) ** 2,dim=(-1))))
+    min_values = absolute_error_s1(p, q)
+    return torch.mean(torch.sqrt(torch.mean(min_values ** 2,dim=(-1))))
 
 def wasserstein_distance(p, q):
     """
@@ -59,7 +72,7 @@ def predicted_residual_error(p, q, bins=10):
     Calculate the predicted residual error between two tensors p and q and store the frequency of the values in bins.
     Both p and q should be torch tensors of the same shape.
     """
-    residual_error = p - q
+    residual_error = absolute_error_s1(p, q)
     hist = torch.histc(residual_error, bins=bins)
     min_val, max_val = torch.min(residual_error), torch.max(residual_error)
     bin_edges = torch.linspace(min_val, max_val, 20 + 1)
@@ -85,29 +98,28 @@ def expected_calibration_error_continuous(y_true, y_pred_cdf, n_bins=10):
 
     # Initialize ECE and bin population
     ece = 0.0
-    total_samples = len(y_true)
+    total_samples = y_true.size(1)
     
     for i in range(n_bins):
         # Get the bin range
         lower_edge = bin_edges[i]
         upper_edge = bin_edges[i + 1]
-        
+        # pdb.set_trace()
         # Find samples in the current bin
         in_bin = (y_true >= lower_edge) & (y_true < upper_edge)
-        n_in_bin = torch.sum(in_bin).item()
+        n_in_bin = torch.sum(in_bin,dim=1)
         
-        if n_in_bin == 0:
-            continue  # Skip empty bins
+        # if n_in_bin == 0:
+        #     continue  # Skip empty bins
         
         # Compute empirical CDF for the bin
-        empirical_cdf = torch.mean((y_true <= upper_edge).float())
+        empirical_cdf = torch.mean((y_true <= upper_edge).float(), dim=1)
 
         # Compute predicted CDF for the bin
-        predicted_cdf = torch.mean(y_pred_cdf[in_bin])
-        
+        predicted_cdf = torch.mean(torch.where(in_bin, y_pred_cdf, torch.tensor(0)), dim=1)
         # Compute the bin's contribution to ECE
         ece += n_in_bin / total_samples * torch.abs(predicted_cdf - empirical_cdf)
-
+    
     return torch.mean(ece)
 
 # # Example usage
@@ -122,7 +134,47 @@ def expected_calibration_error_continuous(y_true, y_pred_cdf, n_bins=10):
 # ece_score = expected_calibration_error_continuous(y_true, y_pred_cdf, n_bins=5)
 # print(f"Expected Calibration Error (ECE): {ece_score}")
 
+def expected_calibration_error(predicted_distribution, true_distribution, M=5):
+    bin_boundaries = torch.linspace(0, 1, M + 1)
+    bin_lowers = bin_boundaries[:-1]
+    bin_uppers = bin_boundaries[1:]
 
+    total_samples = predicted_distribution.shape[-1]
+    batch_size = predicted_distribution.shape[0]
+    ece = torch.zeros(batch_size)
+    for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
+
+        in_bin_pred = torch.logical_and(predicted_distribution > bin_lower, predicted_distribution <= bin_upper)
+        # Identify samples where the true PDF is also within the bin
+        in_bin_true = torch.logical_and(true_distribution > bin_lower, true_distribution <= bin_upper)
+        
+        # Determine the samples that satisfy both conditions
+        matched_samples = torch.logical_and(in_bin_pred, in_bin_true)
+        n_in_bin = torch.sum(in_bin_pred,dim=1)
+        if torch.any(n_in_bin > 0):
+            non_zero_bins = n_in_bin > 0
+            # get the accuracy of bin m: acc(Bm)
+            accuracy_in_bin = torch.where(non_zero_bins, matched_samples.sum(dim=-1) / n_in_bin, torch.tensor(0.0))
+            # get the average confidence of bin m: conf(Bm)
+            masked_tensor = torch.where(in_bin_pred, predicted_distribution, torch.tensor(0.0))
+            avg_confidence_in_bin = torch.where(non_zero_bins, masked_tensor.sum(dim=-1) / n_in_bin, torch.tensor(0.0))
+            # calculate |acc(Bm) - conf(Bm)| * (|Bm|/n) for bin m and add to the total ECE
+            ece += torch.where(non_zero_bins, abs(avg_confidence_in_bin - accuracy_in_bin) * (n_in_bin / total_samples), torch.tensor(0.0))
+
+    return torch.mean(ece)
+
+def sharpness_discrete(pred_probs):
+    """
+    Compute sharpness for discrete distributions based on entropy.
+    
+    Parameters:
+    - pred_probs: torch.Tensor, predicted probabilities (N, K), where K is the number of classes.
+    
+    Returns:
+    - sharpness: float, the average sharpness metric.
+    """
+    entropy = -torch.sum(pred_probs * torch.log(pred_probs + 1e-9), dim=1)  # Add epsilon to avoid log(0)
+    return torch.mean(entropy)
 
 def compute_cdf_from_pdf(pdf):
     """

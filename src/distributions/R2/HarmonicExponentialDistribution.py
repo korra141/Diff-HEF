@@ -166,7 +166,7 @@ class HarmonicExponentialDistribution:
 
         # print("Integrating the distribution",torch.mean(torch.sum(density/z,dim=(1,2))*step_t[0]*step_t[1]))
 
-        return torch.mean(result.squeeze(-1))
+        return result.squeeze(-1)
 
     def normalization_constant(self,density):
         moments = torch.fft.fft2(density)
@@ -191,20 +191,22 @@ class HarmonicExponentialDistribution:
         return padded_tensor
     
     def convolve(self,prob_1, prob_2):
-            padded_length = (2*self.grid_size[0] - 1,2*self.grid_size[1] - 1)
-            prob_1 = self.pad_for_fft_2d(prob_1, padded_length)
-            prob_2 = self.pad_for_fft_2d(prob_2, padded_length)
-            moments_1 = torch.fft.fft2(prob_1)
-            moments_2 = torch.fft.fft2(prob_2)
-            moments_convolve = moments_1 * moments_2
-            unnorm_density_convolve = torch.fft.ifft2(moments_convolve)
-            unnorm_density_convolve_final = unnorm_density_convolve[:,math.floor(self.grid_size[0]/2):math.floor(self.grid_size[0]/2) + self.grid_size[0] ,math.floor(self.grid_size[1]/2):math.floor(self.grid_size[1]/2) + self.grid_size[1]].real
-            unnorm_density_convolve_final = torch.clamp(unnorm_density_convolve_final,min=1e-10)
-            z_3 = self.normalization_constant(unnorm_density_convolve_final)
-            density_convolve = unnorm_density_convolve_final/z_3
-            return density_convolve
+        padded_length = (2*self.grid_size[0] - 1,2*self.grid_size[1] - 1)
+        prob_1 = self.pad_for_fft_2d(prob_1, padded_length)
+        prob_2 = self.pad_for_fft_2d(prob_2, padded_length)
+        moments_1 = torch.fft.fft2(prob_1)
+        moments_2 = torch.fft.fft2(prob_2)
+        moments_convolve = moments_1 * moments_2
+        unnorm_density_convolve = torch.fft.ifft2(moments_convolve)
+        unnorm_density_convolve_final = unnorm_density_convolve[:,math.floor(self.grid_size[0]/2):math.floor(self.grid_size[0]/2) + self.grid_size[0] ,math.floor(self.grid_size[1]/2):math.floor(self.grid_size[1]/2) + self.grid_size[1]].real
+        unnorm_density_convolve_final = torch.clamp(unnorm_density_convolve_final,min=1e-10)
+        z_3 = self.normalization_constant(unnorm_density_convolve_final)
+        density_convolve = unnorm_density_convolve_final/z_3
+        return density_convolve
 
-    def mode(self,predicted_density):
+    def mode(self,predicted_density, ground_truth=None):
+
+        #TODO: Implement the mode function for multimodal to give top n_modes max values
 
         max_vals_row, max_x = torch.max(predicted_density, dim=2)  # max over columns, shape (10, 50)
 
@@ -218,8 +220,8 @@ class HarmonicExponentialDistribution:
         mode_idx = torch.stack((max_x, max_y), dim=1) 
 
         if self.range_x is None and self.range_y is None:
-            min_x = self.range_x_diff/2
-            min_y = self.range_x_diff/2
+            min_x = - self.range_x_diff/2 + ground_truth[:,0]
+            min_y = - self.range_x_diff/2 + ground_truth[:,1]
         else:
             min_x = self.range_x[0]
             min_y = self.range_y[0]

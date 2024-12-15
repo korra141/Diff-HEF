@@ -29,7 +29,7 @@ import pdb
 base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(base_path)
 
-from src.utils.visualisation import plot_circular_distribution, plotting_von_mises,plot_beta_distribution
+from src.utils.visualisation import plot_circular_distribution, plotting_von_mises,plot_beta_distribution,plot_s1_func
 from src.data_generation.S1.toy_dataset import generating_data_S1_unimodal_beta
 from src.distributions.S1.HarmonicExponentialDistribution import HarmonicExponentialDistribution
 from src.distributions.S1.WrappedNormalDitribution import VonMissesDistribution,VonMissesDistribution_torch
@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=100, help='Batch size')
     parser.add_argument('--n_samples', type=int, default=1000, help='Number of samples')
     parser.add_argument('--trajectory_length', type=int, default=100, help='Length of each trajectory')
-    parser.add_argument('--measurement_noise', type=float, default=0.2, help='Standard deviation of the measurement noise')
+    # parser.add_argument('--measurement_noise', type=float, default=0.2, help='Standard deviation of the measurement noise')
     parser.add_argument('--step_size', type=float, default=0.1, help='Step between poses in trajectory')
     parser.add_argument('--range_theta', type=str, default="None", help='Range of theta for local grid')
     parser.add_argument('--gaussian_parameterisation', type=int, default=0, help='Use Gaussian parameterisation')
@@ -101,7 +101,7 @@ class SimpleModel(nn.Module):
                 nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-def validate(model, val_loader, args, hed,logging_path,epoch):
+def validate(model, val_loader, args, hed,beta_noise,logging_path,epoch):
   model.eval()
   val_loss_tot = 0
   val_kl_div_tot = 0
@@ -123,7 +123,7 @@ def validate(model, val_loader, args, hed,logging_path,epoch):
         mu_ = mu.detach()
         cov_ = cov.detach()
         error, hist, bin_centers, bin_edges = predicted_residual_error(mu_, ground_truth,20)
-        measurement_cov = torch.ones_like(cov) * (args.measurement_noise **2)
+        measurement_cov = torch.ones_like(cov) * (beta_noise.variance())
         val_rmse_mu = root_mean_square_error_s1(mu_, ground_truth)
         val_rmse_mu_tot += val_rmse_mu
         val_rmse_cov += root_mean_square_error_s1(cov_, measurement_cov)
@@ -149,18 +149,26 @@ def validate(model, val_loader, args, hed,logging_path,epoch):
         loss = predicted_distribution.negative_loglikelihood(measurements)
       else:
         raise ValueError("Invalid combination of parameters")
-      
-      true_distribution = VonMissesDistribution(ground_truth.numpy(), args.measurement_noise, args.band_limit)
+      kappa = args.alpha + args.beta
+      mean_old = args.alpha / kappa
+      mean_new = (ground_truth.numpy() + (2*math.pi)*mean_old)/(2*math.pi)
+      alpha_new = mean_new * kappa
+      beta_param_new = (1 - mean_new) * kappa
+      true_distribution = BetaDistribution(alpha_new, beta_param_new)
       if args.range_theta is None:
-        true_density = true_distribution.density()
+        true_density = true_distribution.density_over_grid(args.band_limit, args.batch_size)
       else:
-        true_density = true_distribution.density_local(args.range_theta)
-      true_nll += true_distribution.negative_loglikelihood(measurements.numpy())
+        # true_density = true_distribution.density_local(args.range_theta)
+        pass
+      true_nll += true_distribution.negative_log_likelihood(measurements.numpy())
       val_kl_div_tot += kl_divergence_s1(true_density, predicted_density)
       ece = expected_calibration_error(predicted_density, true_density, M=10)
       ece_tot += ece
       sharpness += sharpness_discrete(predicted_density)
       wd_tot += wasserstein_distance(predicted_density, true_density)
+      if torch.isnan(wd_tot).any( )or torch.isnan(val_kl_div_tot).any():
+        print("Nan detected")
+        pdb.set_trace()
       val_loss_tot += loss.item()
       if args.wandb and epoch % 50 == 0 and i == 0:
         indices = np.random.choice(args.batch_size, 5, replace=False)
@@ -172,7 +180,8 @@ def validate(model, val_loader, args, hed,logging_path,epoch):
             ax = plot_circular_distribution(energy[j],legend="predicted distribution",ax=ax)
           else:
             ax = plot_circular_distribution(energy[j],legend="predicted distribution",mean=ground_truth[j,0],range_theta=args.range_theta,ax=ax)
-          ax = plotting_von_mises(ground_truth[j],args.measurement_noise **2, args.band_limit,ax,"true distribution")
+          # ax = plotting_von_mises(ground_truth[j],args.measurement_noise **2, args.band_limit,ax,"true distribution")
+          ax = plot_beta_distribution(alpha_new[j],beta_param_new[j], None, args.band_limit, ax, "true distribution")
           ax.plot(torch.cos(measurements[j]),torch.sin(measurements[j]),'o',label="measurement data")
           ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
           ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
@@ -243,7 +252,7 @@ def main(args):
     print(f"Logging path: {logging_path}")
     os.makedirs(logging_path)
     hed = HarmonicExponentialDistribution(args.band_limit, args.range_theta)
- 
+    beta_noise = BetaDistribution(args.alpha, args.beta)
     # Training loop
     print("Training started!")
     start_time = time.time()
@@ -267,9 +276,9 @@ def main(args):
         lambda_ = lambda_scheduler(epoch)
         print("loss regulariser",lambda_)
       start_epoch_time = time.time()
-      # val_metrics = validate(model, val_loader, args, hed,logging_path,epoch)
-      # if args.wandb:
-      #   wandb.log(val_metrics,commit=False)
+      val_metrics = validate(model, val_loader, args, hed,beta_noise,logging_path,epoch)
+      if args.wandb:
+        wandb.log(val_metrics,commit=False)
       sample_batch = np.random.choice(len(train_loader),1).item()
       for i, (ground_truth, measurements) in enumerate(train_loader):
           if args.gaussian_parameterisation:
@@ -281,7 +290,7 @@ def main(args):
             mu_ = mu.detach()
             cov_ = cov.detach()
             error, hist, bin_centers, bin_edges = predicted_residual_error(mu_, ground_truth,20)
-            measurement_cov = torch.ones_like(cov) * (args.measurement_noise **2)
+            measurement_cov = torch.ones_like(cov) * (beta_noise.variance())
             rmse_mu = root_mean_square_error_s1(mu_,ground_truth)
             rmse_mu_tot += rmse_mu
             rmse_cov += root_mean_square_error_s1(cov_,measurement_cov)
@@ -310,21 +319,27 @@ def main(args):
             nll = loss
           else:
             raise ValueError("Invalid combination of parameters")
-          # kappa = args.alpha + args.beta
-          # alpha = ground_truth.numpy() * kappa
-          # beta_param = (2*math.pi - ground_truth.numpy()) * kappa
-          true_distribution = BetaDistribution(args.alpha, args.beta)
+          kappa = args.alpha + args.beta
+          mean_old = args.alpha / kappa
+          mean_new = (ground_truth.numpy() + (2*math.pi)*mean_old)/(2*math.pi)
+          alpha_new = mean_new * kappa
+          beta_param_new = (1 - mean_new) * kappa
+          true_distribution = BetaDistribution(alpha_new, beta_param_new)
           if args.range_theta == None:
-            true_density = true_distribution.density_translated(ground_truth, args.band_limit)
+            true_density = true_distribution.density_over_grid(args.band_limit, args.batch_size)
+            # print(theta_new.shape)
           else:
             pass
             # true_density = true_distribution.density_local(args.range_theta)
           ece = expected_calibration_error(predicted_density, true_density, M=10)
           ece_tot += ece
           sharpness += sharpness_discrete(predicted_density)
-          # true_nll += true_distribution.negative_log_likelihood(measurements.numpy())
+          true_nll += true_distribution.negative_log_likelihood(measurements.numpy())
           kl_div_tot += kl_divergence_s1(true_density, predicted_density)
           wd_tot += wasserstein_distance(predicted_density, true_density)
+          if torch.isnan(wd_tot).any( )or torch.isnan(kl_div_tot).any():
+            print("Nan detected")
+            pdb.set_trace()
           if args.wandb and epoch % 5 == 0 and i == sample_batch:
             indices = np.random.choice(args.batch_size, 5, replace=False)
             for j in indices:
@@ -336,7 +351,9 @@ def main(args):
               else:
                 ax = plot_circular_distribution(energy[j],legend="predicted distribution",mean=ground_truth[j,0],range_theta=args.range_theta,ax=ax)
               # ax = plotting_von_mises(ground_truth[j],args.measurement_noise**2 , args.band_limit,ax,"true distribution")
-              ax = plot_circular_distribution(true_density[j],legend="true distribution", ax=ax)
+              # ax = plot_s1_func(true_density[j],theta_new=theta_new[j],legend="true distribution", ax=ax)
+              # print(theta_new[j].item())
+              ax = plot_beta_distribution(alpha_new[j],beta_param_new[j], None, args.band_limit, ax, "true distribution")
               ax.plot(torch.cos(measurements[j]),torch.sin(measurements[j]),'o',label="measurement data")
               ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
               ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
@@ -405,7 +422,7 @@ if __name__ == '__main__':
   if torch.cuda.is_available():
       torch.cuda.manual_seed(args.seed)
   if args.wandb:
-    run = wandb.init(mode="disabled",project="Diff-HEF",group="S1",entity="korra141",
+    run = wandb.init(project="Diff-HEF",group="S1",entity="korra141",
               tags=["S1","UncertainityEstimation","BetaNoise"],
               name="S1-UncertainityEstimation",
               config=args)

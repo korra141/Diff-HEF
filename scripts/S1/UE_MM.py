@@ -86,33 +86,51 @@ class EnergyNetwork(nn.Module):
         out = self.relu(out)
         out = self.fc2(out)
         return out
+        #     self.model = nn.Sequential(
+    #         nn.Linear(1, 8),
+    #         nn.ReLU(),
+    #         nn.Linear(8, 3*n_modes)
+    #     )
+    #     self._initialize_weights()
+
+    # def forward(self, x):
+    #     y_pred = self.model(x)
+    #     mu = y_pred[:,0:self.n_modes] %(2 * math.pi)
+    #     logcov = y_pred[:,self.n_modes:2*self.n_modes]
+    #     pi = F.softmax(y_pred[:,2*self.n_modes:],dim=1)
+        
+    #     epsilon = torch.tensor(-1e-2)  # Small value to avoid zero covariance
+    #     logcov = torch.where(logcov < epsilon, epsilon, logcov)
+    #     return mu, logcov, pi
 class SimpleModel(nn.Module):
-    def __init__(self,n_modes):
+    def __init__(self,input_dim, hidden_dim,n_modes):
         super(SimpleModel, self).__init__()
         self.n_modes = n_modes
-        self.model = nn.Sequential(
-            nn.Linear(1, 8),
+        self.hidden = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(8, 3*n_modes)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
         )
-        self._initialize_weights()
+        self.pi = nn.Linear(hidden_dim, self.n_modes)  # Mixing coefficients
+        self.mu = nn.Linear(hidden_dim, self.n_modes)  # Means
+        self.sigma = nn.Linear(hidden_dim, self.n_modes)  # Standard deviations
+        # self._initialize_weights()
 
     def forward(self, x):
-        y_pred = self.model(x)
-        mu = y_pred[:,0:self.n_modes] %(2 * math.pi)
-        logcov = y_pred[:,self.n_modes:2*self.n_modes]
-        pi = F.softmax(y_pred[:,2*self.n_modes:],dim=1)
-        
-        epsilon = torch.tensor(-1e-2)  # Small value to avoid zero covariance
-        logcov = torch.where(logcov < epsilon, epsilon, logcov)
-        return mu, logcov, pi
-
+        h = self.hidden(x)
+        pi = torch.softmax(self.pi(h), dim=-1)  # Mixing coefficients (softmax for probabilities)
+        mu = self.mu(h)  # Means
+        sigma = torch.exp(self.sigma(h))  # Standard deviations (exp for positivity)
+        return mu, sigma, pi
+    
     def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+      for m in self.modules():
+        if isinstance(m, nn.Linear):
+          nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+          if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    
 def validate(model, val_loader, args, hed,centers,measurement_noise,logging_path,epoch):
   model.eval()
   val_loss_tot = 0
@@ -128,9 +146,8 @@ def validate(model, val_loader, args, hed,centers,measurement_noise,logging_path
     for i, (ground_truth, measurements) in enumerate(val_loader):
       mm_mean = positive_angle(ground_truth.unsqueeze(1) + centers)
       if args.gaussian_parameterisation:
-        mu, log_cov, pi = model(ground_truth)
-        cov = torch.exp(log_cov)
-        predicted_distribution = MultimodalGaussianDistribution_torch(mu, cov, pi, args.n_modes_estimated, args.band_limit)
+        mu, sigma, pi = model(ground_truth)
+        predicted_distribution = MultimodalGaussianDistribution_torch(mu, sigma, pi, args.n_modes_estimated, args.band_limit)
         energy = predicted_distribution.energy()
         predicted_density = predicted_distribution.density()
         mu_ = mu.detach().unsqueeze(-1)
@@ -139,13 +156,12 @@ def validate(model, val_loader, args, hed,centers,measurement_noise,logging_path
           mu_temp = mu_temp.detach().unsqueeze(-1)
         else:
           mu_temp = mu_
-        cov_ = cov.detach()
+        sigma_ = sigma.detach()
         error, hist, bin_centers, bin_edges = predicted_residual_error(mu_temp, mm_mean,20)
-      
-        measurement_cov = torch.ones_like(cov) * (args.measurement_noise **2)
+        measurement_sigma = torch.ones_like(sigma) * (args.measurement_noise)
         val_rmse_mu = root_mean_square_error_s1( mu_temp,mm_mean)
         val_rmse_mu_tot += val_rmse_mu
-        val_rmse_cov += root_mean_square_error_s1(cov_,measurement_cov)
+        val_rmse_cov += root_mean_square_error_s1(sigma_, measurement_sigma)
         val_mae_mu = mean_absolute_error( mu_temp,mm_mean)
       else:
         energy = model(ground_truth)
@@ -234,7 +250,7 @@ def main(args):
     val_loader =  generating_data_S1_multimodal(measurement_noise, args.mean_offset,args.n_modes, data_path, args.batch_size, args.batch_size, args.trajectory_length,  args.step_size, True)
 
     if args.gaussian_parameterisation:
-      model = SimpleModel(args.n_modes_estimated)
+      model = SimpleModel(1, args.hidden_size,args.n_modes_estimated)
     else:
       model = EnergyNetwork(1, args.hidden_size, args.band_limit)
     
@@ -279,32 +295,42 @@ def main(args):
         lambda_ = lambda_scheduler(epoch)
         print("loss regulariser",lambda_)
       start_epoch_time = time.time()
-      validate(model, val_loader, args, hed, centers,measurement_noise,logging_path,epoch)
+      # validate(model, val_loader, args, hed, centers,measurement_noise,logging_path,epoch)
       sample_batch = np.random.choice(len(train_loader),1).item()
       for i, (ground_truth, measurements) in enumerate(train_loader):
             start_time = time.time()
             mm_mean = positive_angle(ground_truth.unsqueeze(1) + centers)
             # Forward pass
             if args.gaussian_parameterisation:
-              mu, log_cov, pi = model(ground_truth)
-              cov = torch.exp(log_cov)
-              predicted_distribution = MultimodalGaussianDistribution_torch(mu, cov, pi, args.n_modes_estimated, args.band_limit)
+              mu, sigma, pi = model(ground_truth)
+              if(torch.isnan(pi).any()):
+                print("pi is inf")
+                pdb.set_trace()
+              # cov  = torch.exp(log_cov)
+              predicted_distribution = MultimodalGaussianDistribution_torch(mu, sigma, pi, args.n_modes_estimated, args.band_limit)
               energy = predicted_distribution.energy()
               predicted_density = predicted_distribution.density()
               mu_ = mu.detach().unsqueeze(-1)
-              if mu_.shape[-1] != args.n_modes:
-                mu_temp,_ = torch.topk(predicted_density, args.n_modes, dim=1)
-                mu_temp = mu_temp.detach().unsqueeze(-1)
+              if mu_.shape[1] != args.n_modes:
+                # mu_temp,_ = torch.topk(predicted_density, args.n_modes, dim=1)
+                # mu_temp = mu_temp.detach().unsqueeze(-1)
+                print(pi.size(), args.n_modes)
+                pi_temp,indices = torch.topk(pi, args.n_modes, dim=1)
+                batch_indices = torch.arange(mu_.size(0)).unsqueeze(1) 
+                mu_temp = mu_[batch_indices,indices]
               else:
                 mu_temp = mu_
-              cov_ = cov.detach()
-              error, hist, bin_centers, bin_edges = predicted_residual_error( mu_temp, mm_mean,20)
+              if torch.isnan(mu_temp).any():
+                print("mu is inf")
+                pdb.set_trace()
+              sigma_ = sigma.detach()
+              error, hist, bin_centers, bin_edges = predicted_residual_error(mu_temp, mm_mean,20)
             
-              measurement_cov = torch.ones_like(cov) * (args.measurement_noise **2)
+              measurement_noise_true = torch.ones_like(sigma) * (args.measurement_noise)
               rmse_mu = root_mean_square_error_s1( mu_temp,mm_mean)
               rmse_mu_tot += rmse_mu
-              rmse_cov += root_mean_square_error_s1(cov_,measurement_cov)
-              mae_mu = mean_absolute_error( mu_temp,mm_mean)
+              rmse_cov += root_mean_square_error_s1(sigma_,measurement_noise_true)
+              mae_mu = mean_absolute_error(mu_temp,mm_mean)
             else:
               energy = model(ground_truth)
               predicted_density = torch.exp(energy - hed.normalization_constant(energy))
@@ -327,6 +353,7 @@ def main(args):
 
             elif (args.gaussian_parameterisation and args.gaussianNLL) == 1:
               loss = predicted_distribution.negative_loglikelihood(measurements)
+              nll = loss
             else:
               raise ValueError("Invalid combination of parameters")
              #(batch_size, n_modes, 1)
@@ -411,11 +438,11 @@ if __name__ == '__main__':
   # If you are using CUDA
   if torch.cuda.is_available():
       torch.cuda.manual_seed(args.seed)
-  run = wandb.init(project="Diff-HEF",group="S1",entity="korra141",
+  run = wandb.init(mode='disabled',project="Diff-HEF",group="S1",entity="korra141",
             tags=["S1","UncertainityEstimation","MultimodalNoise"],
             name="S1-UncertainityEstimation",
             config=args)
-  artifact = wandb.Artifact("UE_mm_script_1", type="mm_script")
+  artifact = wandb.Artifact("UE_mm_script_3", type="mm_script")
   artifact.add_file(__file__)
   run.log_artifact(artifact)
   main(args)

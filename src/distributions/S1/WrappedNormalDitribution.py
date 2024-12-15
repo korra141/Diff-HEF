@@ -95,6 +95,7 @@ class MultimodalGaussianDistribution:
         self.weights = weights
 
     def energy(self):
+        # pdb.set_trace()
         energy = torch.zeros((self.batch_size, self.band_limit))
         for i in range(self.n_modes):
             vmd = VonMissesDistribution(self.means[:,i], self.stds[i],self.band_limit)
@@ -125,10 +126,11 @@ class MultimodalGaussianDistribution:
         return torch.mean(-torch.log(torch.clamp(density,min=1e-10))).type(torch.FloatTensor)
     
 class MultimodalGaussianDistribution_torch:
-    def __init__(self, means, covs, pi, n_modes, band_limit):
+    def __init__(self, means, sigma, pi, n_modes, band_limit):
         self.means = means
         self.batch_size = means.shape[0]
-        self.covs = covs
+        self.stds = sigma
+        self.covs = sigma ** 2
         self.n_modes = n_modes
         self.band_limit = band_limit
         # self.weights = torch.ones(n_modes) / n_modes
@@ -149,9 +151,6 @@ class MultimodalGaussianDistribution_torch:
         return density.type(torch.FloatTensor)
     
     def negative_loglikelihood(self, value):
-        density = torch.zeros((self.batch_size,1))
-        for i in range(self.n_modes):
-            vmd = VonMissesDistribution_torch(self.means[:, i:i+1], self.covs[:,i:i+1], self.band_limit)
-            density += self.weights[:,i:i+1] * vmd.density_value(value)
-        
-        return torch.mean(-torch.log(torch.clamp(density,min=1e-10))).type(torch.FloatTensor)
+        vmd = VonMissesDistribution_torch(self.means, self.covs, self.band_limit)
+        density = self.weights * vmd.density_value(value)
+        return torch.mean(-torch.log(torch.sum(torch.clamp(density,min=1e-10), dim=-1))).type(torch.FloatTensor)

@@ -13,7 +13,7 @@ class BetaDistribution:
         return beta.pdf(x, self.alpha, self.beta)/(2*math.pi)
     
     def density_over_grid(self,sample_size,batch_size):
-        grid = np.tile(np.linspace(0, 2*math.pi, sample_size +1)[:-1][None, :], (batch_size, 1))
+        grid = np.tile(np.linspace(0, 1, sample_size +1)[:-1][None, :], (batch_size, 1))
         return torch.tensor(beta.pdf(grid, self.alpha, self.beta)).type(torch.FloatTensor)
 
     # def cdf(self, x):
@@ -33,9 +33,15 @@ class BetaDistribution:
         return beta.var(self.alpha, self.beta)
     
     def density_translated(self, theta_mean,sample_size):
-        theta_new = np.mod(self.mean() + theta_mean.squeeze(-1), 2 * math.pi)
+        # theta_new = np.mod(self.mean() + theta_mean.squeeze(-1), 2 * math.pi)
         density_over_grid = self.density_over_grid(sample_size,theta_mean.shape[0])
-        return density_over_grid[torch.argsort(theta_new)]
+        batch_size, seq_len = density_over_grid.shape
+        shift_indices = (torch.arange(seq_len).unsqueeze(0) + theta_mean) % seq_len  # Wrap indices
+        shift_indices = shift_indices.long()  # Ensure integer indices
+
+        # Gather shifted values
+        shifted_A = torch.gather(density_over_grid, dim=1, index=shift_indices)
+        return shifted_A
     
     def negative_log_likelihood(self, x):
         """Negative log likelihood of the distribution."""

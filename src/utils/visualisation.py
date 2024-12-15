@@ -8,6 +8,9 @@ import imageio
 import re
 import pdb
 from scipy.stats import beta as beta_dist
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.distributions.S1.BetaDistribution import BetaDistribution
 
 def fit_grid_into_larger(mean, range_x_diff, range_y_diff, band_limit, output_density):
     """
@@ -124,22 +127,29 @@ def plot_circular_distribution(energy_samples,mean=None,legend="predicted",ax=No
     ax.text(0, -1.12, r'$3\frac{\pi}{2}$', style='italic', fontsize=20)
     return ax
 
-def plot_s1_func(f, legend=None, ax=None, plot_type: str = 'polar'):
-    if ax is None:
-        _, ax = plt.subplots(1, 1)
-
-    if legend is None:
-        legend = [rf'$prob_{i}$' for i, _ in enumerate(f)]
+def plot_s1_func(f, theta_new=None, legend=None, ax=None):
 
     # Working on unit circle
     radii = 1.0
-    bandwidth = f[0].shape[0]
+    bandwidth = f.shape[0]
+    # maximum = torch.max(energy_samples).unsqueeze(-1)
+    moments = torch.fft.fft(f, dim=-1)
+    z = (2*math.pi*moments[0] / bandwidth).real
+    prob = f/z
+    prob = prob.detach()
+
+
 
     # First plot the support of the distributions S^1
     tensor_start = torch.tensor(0, dtype=torch.float64)
     tensor_stop = torch.tensor(2 * math.pi, dtype=torch.float64)
-    theta = torch.linspace(tensor_start, tensor_stop, bandwidth + 1)[:-1]
-    theta = torch.cat([theta, theta[0].unsqueeze(0)], 0)
+    if theta_new is None:
+      theta = torch.linspace(tensor_start, tensor_stop, bandwidth + 1)[:-1]
+      theta = torch.cat([theta, theta[0].unsqueeze(0)], 0)
+    else:
+      theta = torch.linspace(tensor_start, tensor_stop, bandwidth + 1)[:-1]
+      theta = torch.cat([theta, theta[0].unsqueeze(0)], 0)
+      theta = (theta + theta_new) % (2 * math.pi)
 
     ct = torch.cos(theta)
     st = torch.sin(theta)
@@ -153,17 +163,13 @@ def plot_s1_func(f, legend=None, ax=None, plot_type: str = 'polar'):
     # First plot circle
     ax.plot(ct_1, st_1, 'k-', lw=3, alpha=0.6)
 
-    # Plot functions in polar coordinates
-    for i, f_bar in enumerate(f):
-        # Concat first element to close function
-        # pdb.set_trace()
-        f_bar = torch.concat([f_bar, f_bar[0].unsqueeze(0)], 0)
-        # Use only real components of the function and offset to unit radius
-        f_real = f_bar.real + radii
-        f_x = ct * f_real
-        f_y = st * f_real
-        # Plot circle using x and y coordinates
-        ax.plot(f_x, f_y, '-', lw=3, alpha=0.5, label=legend[i])
+    prob = torch.concat([prob, prob[0].unsqueeze(0)], 0)
+    # Use only real components of the function and offset to unit radius
+    f_real = prob.real + radii
+    f_x = ct * f_real
+    f_y = st * f_real
+    # Plot circle using x and y coordinates
+    ax.plot(f_x, f_y, '-', lw=3, alpha=0.5, label=legend)
     # Only set axis off for polar plot
     plt.axis('off')
     # Set aspect ratio to equal, to create a perfect circle
@@ -192,7 +198,7 @@ def plot_s1_energy(energy_samples_list,
         f.append(prob)
     return plot_s1_func(f, legend, ax, plot_type)
 
-def plot_beta_distribution(alpha, beta, grid_size, ax, legend):
+def plot_beta_distribution(alpha, beta, theta_new, grid_size, ax, legend):
   """
   Plots a beta distribution on a circle.
 
@@ -205,7 +211,11 @@ def plot_beta_distribution(alpha, beta, grid_size, ax, legend):
   """
 
   theta = np.linspace(0, 2 * np.pi, grid_size, endpoint=False)
-  beta_pdf = beta_dist.pdf(theta/(2 * np.pi), alpha, beta)
+  if theta_new is not None:
+    theta = (theta + theta_new) % (2 * np.pi)
+  
+  beta_dist = BetaDistribution(alpha, beta)
+  beta_pdf = beta_dist.pdf(theta/(2 * np.pi))
   radius = 1.0
 
   prob_grid_r = beta_pdf + radius

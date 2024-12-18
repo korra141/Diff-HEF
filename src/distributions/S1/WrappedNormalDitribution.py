@@ -172,6 +172,8 @@ class MultimodalGaussianDistribution_torch:
         return density.type(torch.FloatTensor)
     
     def negative_loglikelihood(self, value):
-        vmd = VonMissesDistribution_torch(self.means, self.covs, self.band_limit)
-        density = self.weights * vmd.density_value(value)
+        density = torch.zeros((self.batch_size,1))
+        for i in range(self.n_modes):
+            vmd = VonMissesDistribution_torch(self.means[:, i:i+1], self.covs[:,i:i+1], self.band_limit)
+            density += self.weights[:,i:i+1] * vmd.density_value(value)
         return torch.mean(-torch.log(torch.sum(torch.clamp(density,min=1e-10), dim=-1))).type(torch.FloatTensor)

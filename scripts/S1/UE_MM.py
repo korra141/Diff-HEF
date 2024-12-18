@@ -31,6 +31,7 @@ import wandb
 import sys
 import pdb
 import random
+import pickle as pkl 
 
 base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(base_path)
@@ -46,7 +47,7 @@ def parse_args():
     parser.add_argument('--input_size', type=int, default=1, help='Input dimensionality')
     parser.add_argument('--hidden_size', type=int, default=10, help='Number of neurons in the hidden layer')
     # parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--num_epochs', type=int, default=1000, help='Number of epochs')
+    parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--band_limit', type=int, default=100, help='Band limit')
     parser.add_argument('--batch_size', type=int, default=100, help='Batch size')
     parser.add_argument('--n_samples', type=int, default=1000, help='Number of samples')
@@ -108,21 +109,32 @@ class SimpleModel(nn.Module):
         self.n_modes = n_modes
         self.hidden = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Sigmoid(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
+            nn.Sigmoid()
         )
         self.pi = nn.Linear(hidden_dim, self.n_modes)  # Mixing coefficients
         self.mu = nn.Linear(hidden_dim, self.n_modes)  # Means
-        self.sigma = nn.Linear(hidden_dim, self.n_modes)  # Standard deviations
+        self.cov = nn.Linear(hidden_dim, self.n_modes)  # Standard deviations
         # self._initialize_weights()
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         h = self.hidden(x)
-        pi = torch.softmax(self.pi(h), dim=-1)  # Mixing coefficients (softmax for probabilities)
-        mu = self.mu(h)  # Means
-        sigma = torch.exp(self.sigma(h))  # Standard deviations (exp for positivity)
-        return mu, sigma, pi
+        # pi_semi = self.sigmoid(self.pi(h))
+        # pi = torch.nn.functional.softmax(pi_semi, dim=-1)  # Mixing coefficients (softmax for probabilities)
+        # mu = self.mu(h)  # Means
+        # sigma = torch.clip(self.sigma(h)**2 + 1e-3, 0, 100) # Standard deviatcons (exp for positivity)
+        # mu = torch.remainder(mu, 2*torch.pi)
+        # sigma = torch.remainder(sigma, 2*torch.pi)
+        # return mu, sigma, pi, h, pi_semi
+    
+        pi = torch.nn.functional.softmax(h, dim=-1)  # Mixing coefficients (softmax for probabilities)
+        mu = self.sigmoid(self.mu(h)) * (2*math.pi)  # Means
+        # sigma = torch.exp(self.sigma(h))
+        # sigma = torch.nn.functional.softplus(self.sigma(h)) + 1e-6
+        cov = torch.clip(self.cov(h) + 1e-3, -10, 10) # Standard deviatcons
+        return mu, cov, pi
     
     def _initialize_weights(self):
       for m in self.modules():
@@ -146,32 +158,33 @@ def validate(model, val_loader, args, hed,centers,measurement_noise,logging_path
     for i, (ground_truth, measurements) in enumerate(val_loader):
       mm_mean = positive_angle(ground_truth.unsqueeze(1) + centers)
       if args.gaussian_parameterisation:
-        mu, sigma, pi = model(ground_truth)
-        predicted_distribution = MultimodalGaussianDistribution_torch(mu, sigma, pi, args.n_modes_estimated, args.band_limit)
+        mu, logcov, pi = model(ground_truth)
+        cov = torch.nn.functional.softplus(logcov) + 1e-6
+        predicted_distribution = MultimodalGaussianDistribution_torch(mu, cov, pi, args.n_modes_estimated, args.band_limit)
         energy = predicted_distribution.energy()
         predicted_density = predicted_distribution.density()
         mu_ = mu.detach().unsqueeze(-1)
-        if mu_.shape[-1] != args.n_modes:
-          mu_temp,_ = torch.topk(predicted_density, args.n_modes, dim=1)
-          mu_temp = mu_temp.detach().unsqueeze(-1)
-        else:
-          mu_temp = mu_
-        sigma_ = sigma.detach()
-        error, hist, bin_centers, bin_edges = predicted_residual_error(mu_temp, mm_mean,20)
-        measurement_sigma = torch.ones_like(sigma) * (args.measurement_noise)
-        val_rmse_mu = root_mean_square_error_s1( mu_temp,mm_mean)
-        val_rmse_mu_tot += val_rmse_mu
-        val_rmse_cov += root_mean_square_error_s1(sigma_, measurement_sigma)
-        val_mae_mu = mean_absolute_error( mu_temp,mm_mean)
+        # if mu_.shape[-1] != args.n_modes:
+        #   mu_temp,_ = torch.topk(predicted_density, args.n_modes, dim=1)
+        #   mu_temp = mu_temp.detach().unsqueeze(-1)
+        # else:
+        #   mu_temp = mu_
+        # sigma_ = sigma.detach()
+        # error, hist, bin_centers, bin_edges = predicted_residual_error(mu_temp, mm_mean,20)
+        # measurement_sigma = torch.ones_like(sigma) * (args.measurement_noise)
+        # val_rmse_mu = root_mean_square_error_s1( mu_temp,mm_mean)
+        # val_rmse_mu_tot += val_rmse_mu
+        # val_rmse_cov += root_mean_square_error_s1(sigma_, measurement_sigma)
+        # val_mae_mu = mean_absolute_error( mu_temp,mm_mean)
       else:
         energy = model(ground_truth)
         predicted_density = torch.exp(energy - hed.normalization_constant(energy))
         mode = hed.mode(predicted_density,ground_truth,n_modes=args.n_modes)
-        error, hist, bin_centers, bin_edges = predicted_residual_error(mode, mm_mean,20)
-        val_rmse_mu = root_mean_square_error_s1(mode, mm_mean)
-        val_rmse_mu_tot += val_rmse_mu
-        val_mae_mu = mean_absolute_error(mode, mm_mean)
-      val_mae_mu_tot += val_mae_mu
+      #   error, hist, bin_centers, bin_edges = predicted_residual_error(mode, mm_mean,20)
+      #   val_rmse_mu = root_mean_square_error_s1(mode, mm_mean)
+      #   val_rmse_mu_tot += val_rmse_mu
+      #   val_mae_mu = mean_absolute_error(mode, mm_mean)
+      # val_mae_mu_tot += val_mae_mu
       
       if args.gaussianNLL == 0:
         if args.range_theta is None:
@@ -195,7 +208,7 @@ def validate(model, val_loader, args, hed,centers,measurement_noise,logging_path
       wd_tot += wasserstein_distance(predicted_density, true_density)
       
       val_loss_tot += loss.item()
-      if epoch % 50 == 0 and i == 0:
+      if (epoch % 100 == 0 or epoch == args.num_epochs -1) and i == 0:
         indices = np.random.choice(args.batch_size, 5, replace=False)
         for j in indices:
           fig, ax = plt.subplots()
@@ -213,6 +226,16 @@ def validate(model, val_loader, args, hed,centers,measurement_noise,logging_path
           plt.savefig(os.path.join(logging_path, f"validation_epoch_{epoch}_batch_{i}_sample_{j}.png"), format='png', dpi=300)
           # plt.show()
           plt.close()
+          plot_dict = {}
+          plot_dict["groundtruth"] = ground_truth[j]
+          plot_dict["measurement"] = measurements[j]
+          plot_dict["true_dist_energy"] = true_distribution_energy[j]
+          plot_dict["predicted_dist_energy"] = energy[j]
+          with open(os.path.join(logging_path, f"validation_epoch_{epoch}_batch_{i}_sample_{j}.pkl"), "wb") as f:
+                    pkl.dump(plot_dict, f)
+                    print(os.path.join(logging_path, f"validation_epoch_{epoch}_batch_{i}_sample_{j}.pkl"))
+
+        '''
         plt.bar(bin_centers.numpy(), hist.numpy(), width=(bin_edges[1] - bin_edges[0]).item(), edgecolor='black', align='center')
         plt.axvline(x=val_mae_mu, color='r', linestyle='-', label='MAE')
         plt.legend()
@@ -222,19 +245,19 @@ def validate(model, val_loader, args, hed,centers,measurement_noise,logging_path
         plt.savefig(os.path.join(logging_path, f"validation_histogram_epoch_{epoch}_batch_{i}.png"), format='png', dpi=300)
         # plt.show()
         plt.close()
-
+        '''
     val_metrics = {
       'Epoch': epoch,
       "True NLL": true_nll / len(val_loader),
       'Validation NLL': val_loss_tot / len(val_loader),     
       'Validation KL Divergence': val_kl_div_tot / len(val_loader),
-      'Validation RMSE Mu': val_rmse_mu_tot / len(val_loader),
-      'Validation MAE Mu' : val_mae_mu / len(val_loader),
+      #'Validation RMSE Mu': val_rmse_mu_tot / len(val_loader),
+      #'Validation MAE Mu' : val_mae_mu / len(val_loader),
       'Validation ECE': ece_tot / len(val_loader),
       'Validation Sharpness': sharpness / len(val_loader),
       'Validation Wasserstein Distance': wd_tot / len(val_loader)}
-    if args.gaussian_parameterisation:
-        val_metrics['Validation RMSE Cov'] = val_rmse_cov / len(val_loader)
+    #if args.gaussian_parameterisation:
+    #    val_metrics['Validation RMSE Cov'] = val_rmse_cov / len(val_loader)
     
     wandb.log(val_metrics,commit=False) 
 
@@ -256,7 +279,8 @@ def main(args):
     
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate_start)
     centers = torch.tile(torch.linspace(-args.mean_offset / 2, args.mean_offset / 2, args.n_modes)[None,:,None], (args.batch_size, 1,1)) # n_modes
-    
+    # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+ 
     lambda_scheduler = lambda epoch: args.lambda_start * (torch.exp(torch.tensor(-args.reg_factor * epoch / args.num_epochs)) - 1)
     if args.reg_factor == 0:
        lambda_ = 0
@@ -295,22 +319,24 @@ def main(args):
         lambda_ = lambda_scheduler(epoch)
         print("loss regulariser",lambda_)
       start_epoch_time = time.time()
-      # validate(model, val_loader, args, hed, centers,measurement_noise,logging_path,epoch)
+      validate(model, val_loader, args, hed, centers,measurement_noise,logging_path,epoch)
       sample_batch = np.random.choice(len(train_loader),1).item()
       for i, (ground_truth, measurements) in enumerate(train_loader):
             start_time = time.time()
             mm_mean = positive_angle(ground_truth.unsqueeze(1) + centers)
             # Forward pass
             if args.gaussian_parameterisation:
-              mu, sigma, pi = model(ground_truth)
+              mu, logcov, pi = model(ground_truth)
+              cov = torch.nn.functional.softplus(logcov) + 1e-6
+              predicted_distribution = MultimodalGaussianDistribution_torch(mu, cov, pi, args.n_modes_estimated, args.band_limit)
               if(torch.isnan(pi).any()):
                 print("pi is inf")
-                pdb.set_trace()
               # cov  = torch.exp(log_cov)
-              predicted_distribution = MultimodalGaussianDistribution_torch(mu, sigma, pi, args.n_modes_estimated, args.band_limit)
+              # predicted_distribution = MultimodalGaussianDistribution_torch(mu, sigma, pi, args.n_modes_estimated, args.band_limit)
               energy = predicted_distribution.energy()
               predicted_density = predicted_distribution.density()
               mu_ = mu.detach().unsqueeze(-1)
+              '''
               if mu_.shape[1] != args.n_modes:
                 # mu_temp,_ = torch.topk(predicted_density, args.n_modes, dim=1)
                 # mu_temp = mu_temp.detach().unsqueeze(-1)
@@ -323,6 +349,7 @@ def main(args):
               if torch.isnan(mu_temp).any():
                 print("mu is inf")
                 pdb.set_trace()
+            
               sigma_ = sigma.detach()
               error, hist, bin_centers, bin_edges = predicted_residual_error(mu_temp, mm_mean,20)
             
@@ -331,22 +358,27 @@ def main(args):
               rmse_mu_tot += rmse_mu
               rmse_cov += root_mean_square_error_s1(sigma_,measurement_noise_true)
               mae_mu = mean_absolute_error(mu_temp,mm_mean)
+              '''
             else:
               energy = model(ground_truth)
               predicted_density = torch.exp(energy - hed.normalization_constant(energy))
               mode = hed.mode(predicted_density,ground_truth,n_modes=args.n_modes)
               # print(mode.shape,mm_mean.shape)
+              '''
               error, hist, bin_centers, bin_edges = predicted_residual_error(mode, mm_mean,20)
             
               rmse_mu = root_mean_square_error_s1(mode, mm_mean)
               rmse_mu_tot += rmse_mu
               mae_mu = mean_absolute_error(mode, mm_mean)
             mae_mu_tot += mae_mu
-
+            '''
             if args.gaussianNLL == 0:
               if args.range_theta == None:
                 nll = hed.negative_log_likelihood(energy, measurements)
                 loss = hed.loss_regularisation_norm(lambda_,energy,measurements,scaling_factor=1/args.lambda_start)
+                if torch.isnan(loss).any() or torch.isinf(loss).any():
+                  print("loss is nan")
+                  # pdb.set_trace()
               else:
                 nll = hed.negative_log_likelihood_local(energy, measurements, ground_truth)
                 loss = hed.loss_regularisation_norm(lambda_,energy,measurements,ground_truth,scaling_factor=1/args.lambda_start)
@@ -371,7 +403,7 @@ def main(args):
             kl_div_tot += kl_divergence_s1(true_distribution_density, predicted_density)
             wd_tot += wasserstein_distance(predicted_density, true_distribution_density)
             
-            if epoch % 50 == 0 and i  == sample_batch:
+            if (epoch % 100 == 0 or epoch == args.num_epochs -1) and i  == sample_batch:
               indices = np.random.choice(args.batch_size, 5, replace=False)
               for j in indices:
                 fig, ax = plt.subplots()
@@ -388,18 +420,39 @@ def main(args):
                 plt.savefig(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.png"), format='png', dpi=300)
                 # plt.show()
                 plt.close()
-              plt.bar(bin_centers.numpy(), hist.numpy(), width=(bin_edges[1] - bin_edges[0]).item(), edgecolor='black', align='center')
-              plt.axvline(x=mae_mu, color='r', linestyle='-', label='MAE')
-              plt.legend()
+                plot_dict = {}
+                plot_dict["groundtruth"] = ground_truth[j]
+                plot_dict["measurement"] = measurements[j]
+                plot_dict["true_dist_energy"] = true_distribution_energy[j]
+                plot_dict["predicted_dist_energy"] = energy[j]
+                with open(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.pkl"), "wb") as f:
+                    pkl.dump(plot_dict, f)
+                    print(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.pkl"))
+                '''
+                #plt.bar(bin_centers.numpy(), hist.numpy(), width=(bin_edges[1] - bin_edges[0]).item(), edgecolor='black', align='center')
+              #plt.axvline(x=mae_mu, color='r', linestyle='-', label='MAE')
+              #plt.legend()
               plt.xlabel('Value')
               plt.ylabel('Count')
               plt.title('Histogram predicted residual error')
               plt.savefig(os.path.join(logging_path, f"training_histogram_epoch_{epoch}_batch_{i}.png"), format='png', dpi=300)
               plt.close()
+              '''
 
             # Backward pass and optimization
             optimizer.zero_grad()
+            # torch.autograd.set_detect_anomaly(True)
             loss.backward()
+            # grad_norm = 0
+            # for name, param in model.named_parameters():
+            #   if param.grad is not None:
+            #     grad_norm += param.grad.norm()
+             
+            # if torch.isnan(grad_norm).any() or torch.isinf(grad_norm).any() :
+            #   print("grad norm is nan or inf")
+            #   pdb.set_trace()
+            # if i % 500 ==0:
+            #     print(f"Epoch {epoch}, Batch {i}, Gradient norm: {grad_norm}")
             optimizer.step()
             loss_tot += loss.item()
             nll_tot += nll.item()
@@ -411,20 +464,24 @@ def main(args):
           'True NLL': true_nll / len(train_loader),
           'Loss': loss_tot / len(train_loader),
           'KL Divergence': kl_div_tot / len(train_loader),
-          'RMSE Mu': rmse_mu_tot / len(train_loader),
-          'MAE Mu':mae_mu_tot / len(train_loader),
+          #'RMSE Mu': rmse_mu_tot / len(train_loader),
+          #'MAE Mu':mae_mu_tot / len(train_loader),
           'ECE': ece_tot / len(train_loader), 
           'Sharpness': sharpness / len(train_loader),
           'Wasserstein Distance': wd_tot / len(train_loader)}
-      if args.gaussian_parameterisation:
-          metrics['RMSE Cov'] = rmse_cov / len(train_loader)
+        # Log all the generated images to wandb
+#if args.gaussian_parameterisation:
+      #    metrics['RMSE Cov'] = rmse_cov / len(train_loader)
       wandb.log(metrics)
-      print("Training finished!")
-      print(f"Training took {time.time() - start_time} seconds")
-    # Log all the generated images to wandb
+    print("Training finished!")
     for img_file in os.listdir(logging_path):
-        if img_file.endswith(".png"):
-            wandb.log({f"{img_file}": wandb.Image(os.path.join(logging_path, img_file))})
+      print(img_file)
+      if img_file.endswith(".pkl"):
+          wandb.save(os.path.join(logging_path, img_file))
+      if img_file.endswith(".png"):
+          wandb.log({f"{img_file}": wandb.Image(os.path.join(logging_path, img_file))})
+
+    print(f"Training took {time.time() - start_time} seconds")
 
 
 if __name__ == '__main__':
@@ -438,7 +495,7 @@ if __name__ == '__main__':
   # If you are using CUDA
   if torch.cuda.is_available():
       torch.cuda.manual_seed(args.seed)
-  run = wandb.init(mode='disabled',project="Diff-HEF",group="S1",entity="korra141",
+  run = wandb.init(project="Diff-HEF",group="S1",entity="korra141",
             tags=["S1","UncertainityEstimation","MultimodalNoise"],
             name="S1-UncertainityEstimation",
             config=args)

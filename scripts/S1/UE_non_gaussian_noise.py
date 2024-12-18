@@ -26,6 +26,7 @@ import wandb
 import sys
 import random
 import pdb
+import pickle as pkl 
 base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(base_path)
 
@@ -59,7 +60,7 @@ def parse_args():
     parser.add_argument('--lambda_start', type=float, default=100, help='Initial lambda for regularization')
     parser.add_argument('--lr_factor', type=float, default=10, help='Factor for learning rate decay')
     parser.add_argument('--reg_factor', type=float, default=0, help='Factor for regularization decay')
-    parser.add_argument('--alpha', type=float, default=2, help='Alpha parameter for the Beta distribution')
+    parser.add_argument('--alpha', type=float, default=1.5, help='Alpha parameter for the Beta distribution')
     parser.add_argument('--beta', type=float, default=5, help='Beta parameter for the Beta distribution')
     return parser.parse_args()  
 
@@ -149,26 +150,22 @@ def validate(model, val_loader, args, hed,beta_noise,logging_path,epoch):
         loss = predicted_distribution.negative_loglikelihood(measurements)
       else:
         raise ValueError("Invalid combination of parameters")
-      kappa = args.alpha + args.beta
-      mean_old = args.alpha / kappa
-      mean_new = (ground_truth.numpy() + (2*math.pi)*mean_old)/(2*math.pi)
-      alpha_new = mean_new * kappa
-      beta_param_new = (1 - mean_new) * kappa
-      true_distribution = BetaDistribution(alpha_new, beta_param_new)
-      if args.range_theta is None:
-        true_density = true_distribution.density_over_grid(args.band_limit, args.batch_size)
+    
+      true_distribution = BetaDistribution(args.alpha, args.beta)
+      if args.range_theta == None:
+        true_density = true_distribution.density_translated(ground_truth,args.band_limit)
+        true_density_plot = true_distribution.density_translated(ground_truth,args.samples_size)
       else:
         # true_density = true_distribution.density_local(args.range_theta)
         pass
-      true_nll += true_distribution.negative_log_likelihood(measurements.numpy())
+      true_nll += true_distribution.negative_loglikelihood(measurements.numpy())
       val_kl_div_tot += kl_divergence_s1(true_density, predicted_density)
       ece = expected_calibration_error(predicted_density, true_density, M=10)
       ece_tot += ece
       sharpness += sharpness_discrete(predicted_density)
       wd_tot += wasserstein_distance(predicted_density, true_density)
-      if torch.isnan(wd_tot).any( )or torch.isnan(val_kl_div_tot).any():
-        print("Nan detected")
-        pdb.set_trace()
+      if torch.isnan(wd_tot).any( )or torch.isnan(val_kl_div_tot).any() or torch.isinf(wd_tot).any( ) or torch.isinf(val_kl_div_tot).any( ):
+        print("Nan or Inf detected")
       val_loss_tot += loss.item()
       if args.wandb and epoch % 50 == 0 and i == 0:
         indices = np.random.choice(args.batch_size, 5, replace=False)
@@ -181,7 +178,7 @@ def validate(model, val_loader, args, hed,beta_noise,logging_path,epoch):
           else:
             ax = plot_circular_distribution(energy[j],legend="predicted distribution",mean=ground_truth[j,0],range_theta=args.range_theta,ax=ax)
           # ax = plotting_von_mises(ground_truth[j],args.measurement_noise **2, args.band_limit,ax,"true distribution")
-          ax = plot_beta_distribution(alpha_new[j],beta_param_new[j], None, args.band_limit, ax, "true distribution")
+          ax = plot_beta_distribution(true_density_plot[j],args.samples_size, ax, "true distribution")
           ax.plot(torch.cos(measurements[j]),torch.sin(measurements[j]),'o',label="measurement data")
           ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
           ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
@@ -190,6 +187,15 @@ def validate(model, val_loader, args, hed,beta_noise,logging_path,epoch):
           plt.savefig(os.path.join(logging_path, f"validation_epoch_{epoch}_batch_{i}_sample_{j}.png"), format='png', dpi=300)
           # plt.show()
           plt.close()
+          plot_dict = {}
+          plot_dict["groundtruth"] = ground_truth[j]
+          plot_dict["measurement"] = measurements[j]
+          plot_dict["true_dist_energy"] = true_density_plot[j]
+          plot_dict["predicted_dist_energy"] = energy[j]
+          with open(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.pkl"), "wb") as f:
+            pkl.dump(plot_dict, f)
+            print(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.pkl"))
+
         fig, ax = plt.subplots()
           # Plot the histogram
         plt.bar(bin_centers.numpy(), hist.numpy(), width=(bin_edges[1] - bin_edges[0]).item(), edgecolor='black', align='center')
@@ -233,6 +239,8 @@ def main(args):
     else:
       model = EnergyNetwork(1, args.hidden_size, args.band_limit)
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate_start)
+
+    args.samples_size = 100
     
     lambda_scheduler = lambda epoch: args.lambda_start * (torch.exp(torch.tensor(-args.reg_factor * epoch / args.num_epochs)) - 1)
     if args.reg_factor == 0:
@@ -319,14 +327,11 @@ def main(args):
             nll = loss
           else:
             raise ValueError("Invalid combination of parameters")
-          kappa = args.alpha + args.beta
-          mean_old = args.alpha / kappa
-          mean_new = (ground_truth.numpy() + (2*math.pi)*mean_old)/(2*math.pi)
-          alpha_new = mean_new * kappa
-          beta_param_new = (1 - mean_new) * kappa
-          true_distribution = BetaDistribution(alpha_new, beta_param_new)
+          true_distribution = BetaDistribution(args.alpha, args.beta)
           if args.range_theta == None:
-            true_density = true_distribution.density_over_grid(args.band_limit, args.batch_size)
+            true_density = true_distribution.density_translated(ground_truth,args.band_limit)
+            true_density_plot = true_distribution.density_translated(ground_truth,args.samples_size)
+
             # print(theta_new.shape)
           else:
             pass
@@ -334,13 +339,12 @@ def main(args):
           ece = expected_calibration_error(predicted_density, true_density, M=10)
           ece_tot += ece
           sharpness += sharpness_discrete(predicted_density)
-          true_nll += true_distribution.negative_log_likelihood(measurements.numpy())
+          true_nll += true_distribution.negative_loglikelihood(measurements.numpy())
           kl_div_tot += kl_divergence_s1(true_density, predicted_density)
           wd_tot += wasserstein_distance(predicted_density, true_density)
-          if torch.isnan(wd_tot).any( )or torch.isnan(kl_div_tot).any():
-            print("Nan detected")
-            pdb.set_trace()
-          if args.wandb and epoch % 5 == 0 and i == sample_batch:
+          if torch.isnan(wd_tot).any( )or torch.isnan(kl_div_tot).any() or torch.isinf(wd_tot).any( ) or torch.isinf(kl_div_tot).any( ):
+            print("Nan or Inf detected")
+          if args.wandb and epoch % 50 == 0 and i == sample_batch:
             indices = np.random.choice(args.batch_size, 5, replace=False)
             for j in indices:
               fig, ax = plt.subplots()
@@ -353,7 +357,7 @@ def main(args):
               # ax = plotting_von_mises(ground_truth[j],args.measurement_noise**2 , args.band_limit,ax,"true distribution")
               # ax = plot_s1_func(true_density[j],theta_new=theta_new[j],legend="true distribution", ax=ax)
               # print(theta_new[j].item())
-              ax = plot_beta_distribution(alpha_new[j],beta_param_new[j], None, args.band_limit, ax, "true distribution")
+              ax = plot_beta_distribution(true_density_plot[j],args.samples_size, ax, "true distribution")
               ax.plot(torch.cos(measurements[j]),torch.sin(measurements[j]),'o',label="measurement data")
               ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
               ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
@@ -362,6 +366,15 @@ def main(args):
               plt.savefig(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.png"), format='png', dpi=300)
               # plt.show()
               plt.close()
+              plot_dict = {}
+              plot_dict["groundtruth"] = ground_truth[j]
+              plot_dict["measurement"] = measurements[j]
+              plot_dict["true_dist_energy"] = true_density_plot[j]
+              plot_dict["predicted_dist_energy"] = energy[j]
+              with open(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.pkl"), "wb") as f:
+                pkl.dump(plot_dict, f)
+                print(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.pkl"))
+
             plt.bar(bin_centers.numpy(), hist.numpy(), width=(bin_edges[1] - bin_edges[0]).item(), edgecolor='black', align='center')
             plt.axvline(x=mae_mu, color='r', linestyle='-', label='MAE')
             plt.legend()
@@ -370,6 +383,7 @@ def main(args):
             plt.title('Histogram predicted residual error')
             plt.savefig(os.path.join(logging_path, f"training_histogram_epoch_{epoch}_batch_{i}.png"), format='png', dpi=300)
             plt.close()
+            
 
 
         # Backward pass and optimization
@@ -379,7 +393,7 @@ def main(args):
           loss_tot += loss.item()
           nll_tot += nll.item()
       print(f"Epoch {epoch+1} took {time.time() - start_epoch_time} seconds")
-      print(f'Epoch [{epoch+1}/{args.num_epochs}], Loss: {loss_tot/len(train_loader):.4f}, RMSE Mu: {rmse_mu_tot/len(train_loader):.4f}, MAE Mu: {mae_mu_tot/len(train_loader):.4f}, KL Divergence: {kl_div_tot/len(train_loader):.4f}')
+      print(f'Epoch [{epoch+1}/{args.num_epochs}], Loss: {loss_tot/len(train_loader):.4f}, RMSE Mu: {rmse_mu_tot/len(train_loader):.4f}, MAE Mu: {mae_mu_tot/len(train_loader):.4f}, KL Divergence: {kl_div_tot/len(train_loader):.4f}, WL: {wd_tot/len(train_loader):.4f}')
       print(f"ECE: {ece_tot/len(train_loader):.4f}, Sharpness: {sharpness/len(train_loader):.4f}")
       metrics = {
           'Epoch': epoch + 1,
@@ -426,7 +440,7 @@ if __name__ == '__main__':
               tags=["S1","UncertainityEstimation","BetaNoise"],
               name="S1-UncertainityEstimation",
               config=args)
-    artifact = wandb.Artifact("UE_script_2", type="script")
+    artifact = wandb.Artifact("UE_script_3", type="script")
     artifact.add_file(__file__)
     run.log_artifact(artifact)
   main(args)

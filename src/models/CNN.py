@@ -31,15 +31,6 @@ class DensityPredictorCNN(nn.Module):
         x = F.leaky_relu(self.conv2(x))
         x = self.conv3(x)
         x = F.relu(x.squeeze(1))
-        # batch_size, dim1, dim2, *rest = x.shape
-        # x = x.view(batch_size, dim1 * dim2, *rest)
-
-        # # # Apply softmax along the combined dimension (dim1 * dim2)
-        # x = F.softmax(x, dim=1)
-
-        # # # Reshape back to the original shape
-        # x = x.view(batch_size, dim1, dim2, *rest)
-
         x = x[:,1:1+self.grid_size[0], 1:1+self.grid_size[1]]
 
         return torch.clamp(x,min=1e-10)

@@ -50,15 +50,22 @@ class VonMissesDistribution_torch:
         self.band_limit = band_limit
         self.batch_size = mean.shape[0]
     
-    def safe_i0(self, kappa):
+    def safe_i0(self, kappa, log_i0=False):
       """
       Compute the modified Bessel function of the first kind, I_0(kappa),
       with a safe approach for large kappa values.
       """
       if torch.max(kappa) > 40:  # Handle large values
-          return torch.exp(kappa - torch.log(2 * math.pi * kappa) / 2)  
-      return torch.special.i0(kappa)
-    
+          if log_i0:
+            i_0 = kappa - torch.log(2 * math.pi * kappa) / 2
+          else:
+            i_0 = torch.exp(kappa - torch.log(2 * math.pi * kappa) / 2)  
+      else:
+          if log_i0:
+            i_0 = torch.log(torch.special.i0(kappa))
+          else:
+            i_0 = torch.special.i0(kappa)
+      return i_0
     def energy(self):
         grid = torch.tile(torch.linspace(0, 2*math.pi, self.band_limit+1)[:-1][None,:],(self.batch_size, 1))
         kappa = 1/(self.cov)
@@ -69,19 +76,33 @@ class VonMissesDistribution_torch:
         kappa = 1/(self.cov)
         if torch.any(torch.isnan(self.safe_i0(kappa))):
             print("torch bessel is nan")
-        return torch.mean(- kappa * torch.cos(value - self.mean) + torch.log(2*math.pi*self.safe_i0(kappa)))
+        return torch.mean(- kappa * torch.cos(value - self.mean) + torch.log(torch.tensor(2*math.pi)) + self.safe_i0(kappa, log_i0=True))
     
     def density(self):
         grid = torch.tile(torch.linspace(0, 2*math.pi, self.band_limit+1)[:-1][None,:],(self.batch_size, 1))
         kappa = (1/(self.cov))
         mean = self.mean
         density = torch.exp(kappa * torch.cos(grid - mean)) / (2 * math.pi * self.safe_i0(kappa))
+        temp = torch.sqrt(kappa/(2*math.pi))
+        density = torch.where(torch.isinf(density), temp, density)
+        density = torch.clamp(density, min=1e-10)
+        density = torch.clamp(density, max=1e+10)
+        density = density.nan_to_num_(nan=0.0)
+        if (torch.isnan(density).any()):
+            print("density is nan")
         return density
     
     def density_value(self,value):
         # grid = torch.tile(torch.linspace(0, 2*math.pi, self.band_limit+1)[:-1][None,:],(self.batch_size, 1))
         kappa = (1/(self.cov))
         density = torch.exp(kappa * torch.cos(value - self.mean)) / (2 * math.pi * self.safe_i0(kappa))
+        temp = torch.sqrt(kappa/(2*math.pi))
+        density = torch.where(torch.isinf(density), temp, density)
+        density = torch.clamp(density, min=1e-10)
+        density = torch.clamp(density, max=1e+10)
+        density = density.nan_to_num_(nan=0.0)
+        if (torch.isnan(density).any()):
+            print("density is nan")
         return density
 
 
@@ -126,11 +147,11 @@ class MultimodalGaussianDistribution:
         return torch.mean(-torch.log(torch.clamp(density,min=1e-10))).type(torch.FloatTensor)
     
 class MultimodalGaussianDistribution_torch:
-    def __init__(self, means, sigma, pi, n_modes, band_limit):
+    def __init__(self, means, covs, pi, n_modes, band_limit):
         self.means = means
         self.batch_size = means.shape[0]
-        self.stds = sigma
-        self.covs = sigma ** 2
+        # self.stds = sigma
+        self.covs = covs
         self.n_modes = n_modes
         self.band_limit = band_limit
         # self.weights = torch.ones(n_modes) / n_modes

@@ -31,14 +31,16 @@ import wandb
 import sys
 import pdb
 import random
+import pickle as pkl 
 
 base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(base_path)
 
-from src.data_generation.S1.toy_dataset import generating_data_S1_heteroscedastic,heteroscedastic_noise
+from src.data_generation.S1.toy_dataset import generating_data_S1_heteroscedastic,heteroscedastic_noise,generating_data_S1_heteroscedastic_beta,mean_var
 from src.distributions.S1.HarmonicExponentialDistribution import HarmonicExponentialDistribution
 from src.distributions.S1.WrappedNormalDitribution import VonMissesDistribution,VonMissesDistribution_torch
-from src.utils.visualisation import plot_circular_distribution, plotting_von_mises
+from src.utils.visualisation import plot_circular_distribution, plotting_von_mises, plot_beta_distribution
+from src.distributions.S1.BetaDistribution import BetaDistribution
 from src.utils.metrics import kl_divergence_s1,root_mean_square_error_s1,mean_absolute_error, expected_calibration_error_continuous, compute_cdf_from_pdf, predicted_residual_error, wasserstein_distance,expected_calibration_error, sharpness_discrete
 import random
 import string
@@ -66,6 +68,8 @@ def parse_args():
     parser.add_argument('--lambda_start', type=float, default=100, help='Initial lambda for regularization')
     parser.add_argument('--lr_factor', type=float, default=10, help='Factor for learning rate decay')
     parser.add_argument('--reg_factor', type=float, default=0, help='Factor for regularization decay')
+    parser.add_argument('--alpha', type=float, default=None, help='Alpha parameter')
+    parser.add_argument('--beta', type=float, default=None, help='Beta parameter')
     return parser.parse_args()  
 
 # Define the neural network architecture
@@ -90,15 +94,17 @@ class SimpleModel(nn.Module):
             nn.ReLU(),
             nn.Linear(8, 2)
         )
+        self.sigmoid = nn.Sigmoid()
         self._initialize_weights()
 
     def forward(self, x):
         y_pred = self.model(x)
-        mu = y_pred[:,0:1] %(2 * math.pi)
+        mu = y_pred[:,0]
+        mu = (self.sigmoid(mu) * (2 * math.pi))
         logcov = y_pred[:,1:2]
         # epsilon = torch.tensor(-1e-2)  # Small value to avoid zero covariance
         # logcov = torch.where(logcov < epsilon, epsilon, logcov)
-        return mu, logcov
+        return mu[:,None], logcov
 
     def _initialize_weights(self):
         for m in self.modules():
@@ -107,7 +113,7 @@ class SimpleModel(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-def validate(model, val_loader, args, hed,logging_path,epoch):
+def validate(model, val_loader, args, hed,logging_path,epoch,non_gaussian=False):
   model.eval()
   val_loss_tot = 0
   val_kl_div_tot = 0
@@ -129,7 +135,9 @@ def validate(model, val_loader, args, hed,logging_path,epoch):
         mu_ = mu.detach()
         cov_ = cov.detach()
         error, hist, bin_centers, bin_edges = predicted_residual_error(mu_, ground_truth,20)
-       
+        # if non_gaussian:
+        #   measurement_cov = heteroscedastic_noise(ground_truth, args.measurement_noise_min, args.measurement_noise_max) ** 2
+        # else:
         measurement_cov = heteroscedastic_noise(ground_truth, args.measurement_noise_min, args.measurement_noise_max) ** 2
         val_rmse_mu = root_mean_square_error_s1(mu_, ground_truth)
         val_rmse_mu_tot += val_rmse_mu
@@ -155,18 +163,28 @@ def validate(model, val_loader, args, hed,logging_path,epoch):
         loss = predicted_distribution.negative_loglikelihood(measurements)
       else:
         raise ValueError("Invalid combination of parameters")
-      
-      true_distribution = VonMissesDistribution(ground_truth.numpy(), heteroscedastic_noise(ground_truth, args.measurement_noise_min, args.measurement_noise_max).numpy(), args.band_limit)
-      if args.range_theta is None:
-        true_density = true_distribution.density()
+      if non_gaussian:
+        noise_ = heteroscedastic_noise(ground_truth, args.measurement_noise_min, args.measurement_noise_max)
+        mean_ = args.alpha/(args.alpha + args.beta)
+        alpha_, beta_ = mean_var(mean_, noise_)
+        true_distribution = BetaDistribution(alpha_, beta_)
+        true_density = true_distribution.density_translated(ground_truth,args.band_limit)
+        true_density_plot = true_distribution.density_translated(ground_truth,args.samples_size) 
       else:
-        true_density = true_distribution.density_local(args.range_theta)
+        true_distribution = VonMissesDistribution(ground_truth.numpy(), heteroscedastic_noise(ground_truth, args.measurement_noise_min, args.measurement_noise_max).numpy(), args.band_limit)
+        if args.range_theta is None:
+          true_density = true_distribution.density()
+        else:
+          true_density = true_distribution.density_local(args.range_theta)
       true_nll += true_distribution.negative_loglikelihood(measurements.numpy())
       val_kl_div_tot += kl_divergence_s1(true_density, predicted_density)
       ece = expected_calibration_error(predicted_density, true_density, M=10)
       ece_tot += ece
       sharpness += sharpness_discrete(predicted_density)
       wd_tot += wasserstein_distance(predicted_density, true_density)
+      if torch.isnan(wd_tot).any( )or torch.isnan(val_kl_div_tot).any() or torch.isinf(wd_tot).any( ) or torch.isinf(val_kl_div_tot).any( ):
+        print("Nan or Inf detected in metrics")
+        # pdb.set_trace()
       val_loss_tot += loss.item()
       if epoch % 50 == 0 and i == 0:
         indices = np.random.choice(args.batch_size, 5, replace=False)
@@ -178,7 +196,10 @@ def validate(model, val_loader, args, hed,logging_path,epoch):
             ax = plot_circular_distribution(energy[j],legend="predicted distribution",ax=ax)
           else:
             ax = plot_circular_distribution(energy[j],legend="predicted distribution",mean=ground_truth[j,0],range_theta=args.range_theta,ax=ax)
-          ax = plotting_von_mises(ground_truth[j],heteroscedastic_noise(ground_truth[j], args.measurement_noise_min, args.measurement_noise_max).item()**2, args.band_limit,ax,"true distribution")
+          if non_gaussian:
+            ax = plot_beta_distribution(true_density_plot[j],args.samples_size, ax, "true distribution")
+          else: 
+            ax = plotting_von_mises(ground_truth[j],heteroscedastic_noise(ground_truth[j], args.measurement_noise_min, args.measurement_noise_max).item()**2, args.band_limit,ax,"true distribution")
           ax.plot(torch.cos(measurements[j]),torch.sin(measurements[j]),'o',label="measurement data")
           ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
           ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
@@ -218,28 +239,41 @@ def main(args):
 
     if args.range_theta is not None and (args.gaussian_parameterisation == 1 or args.gaussianNLL == 1):
       raise ValueError("Invalid combination of parameters: range_theta cannot be used with gaussian_parameterisation or gaussianNLL")
+    
+    if args.alpha <= 0 or args.beta <= 0:
+      raise ValueError("Alpha and beta must be positive")
+
+    if args.alpha is not None and args.beta is not None:
+      non_gaussian=True
     # Generate training data
     data_path =  os.path.join(base_path, 'data')
-    train_loader =  generating_data_S1_heteroscedastic(data_path, args, args.batch_size, args.n_samples, args.trajectory_length, args.measurement_noise_min, args.step_size, True)
-    val_loader = generating_data_S1_heteroscedastic(data_path,args, args.batch_size, args.batch_size, args.trajectory_length, args.measurement_noise_min, args.step_size, False)
+    if not non_gaussian:
+      train_loader =  generating_data_S1_heteroscedastic(data_path, args, args.batch_size, args.n_samples, args.trajectory_length, args.measurement_noise_min, args.step_size, True)
+      val_loader = generating_data_S1_heteroscedastic(data_path,args, args.batch_size, args.batch_size, args.trajectory_length, args.measurement_noise_min, args.step_size, False)
+    else: 
+      train_loader =  generating_data_S1_heteroscedastic_beta(data_path, args, args.batch_size, args.n_samples, args.trajectory_length, args.step_size, True)
+      val_loader = generating_data_S1_heteroscedastic(data_path,args, args.batch_size, args.batch_size, args.trajectory_length, args.step_size, False)
     # Initialize the model, optimizer, and loss function
     if args.gaussian_parameterisation:
         model = SimpleModel()
     else:
       model = EnergyNetwork(1, args.hidden_size, args.band_limit)
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate_start)
+    args.samples_size = 100
     lambda_scheduler = lambda epoch: args.lambda_start * (torch.exp(torch.tensor(-args.reg_factor * epoch / args.num_epochs)) - 1)
     if args.reg_factor == 0:
        lambda_ = 0
+    
+
     ctime = time.time()
     ctime = strftime('%Y-%m-%d %H:%M:%S', localtime(ctime))
     random_number = random.randint(1000, 9999)
     if args.range_theta == None and args.gaussian_parameterisation == 0:
-        run_name = "S1-UE-Heteroscedastic"    
+        run_name = "S1-UE-Hetero"    
     elif args.range_theta == None and args.gaussian_parameterisation == 1:
-        run_name = "S1-UE-Heteroscedastic-Gaussian"
+        run_name = "S1-UE-Hetero-Gaussian"
     else:
-        run_name = "S1-UE-Heteroscedastic-Local"
+        run_name = "S1-UE-Hetero-Local"
 
     logging_path = os.path.join(base_path,"logs", run_name, str(ctime) + "_" + str(random_number))
     print(f"Logging path: {logging_path}")
@@ -267,7 +301,7 @@ def main(args):
           lambda_ = lambda_scheduler(epoch)
           print("loss regulariser",lambda_)
         start_epoch_time = time.time()
-        val_metrics = validate(model, val_loader, args, hed,logging_path,epoch)
+        val_metrics = validate(model, val_loader, args, hed,logging_path,epoch,non_gaussian)
         wandb.log(val_metrics,commit=False)
         sample_batch = np.random.choice(len(train_loader),1).item()
         for i, (ground_truth, measurements) in enumerate(train_loader):
@@ -279,6 +313,9 @@ def main(args):
             predicted_density = predicted_distribution.density()
             mu_ = mu.detach()
             cov_ = cov.detach()
+            # if non_gaussian:
+            #   measurement_cov = heteroscedastic_noise(ground_truth, args.measurement_noise_min, args.measurement_noise_max) ** 2 
+            # else:
             measurement_cov = heteroscedastic_noise(ground_truth, args.measurement_noise_min, args.measurement_noise_max) ** 2
             error, hist, bin_centers, bin_edges = predicted_residual_error(mu_, ground_truth,20)
             rmse_mu = root_mean_square_error_s1(mu_,ground_truth)
@@ -309,17 +346,30 @@ def main(args):
           else:
             raise ValueError("Invalid combination of parameters")
           # pdb.set_trace()
-          true_distribution = VonMissesDistribution(ground_truth.numpy(),heteroscedastic_noise(ground_truth, args.measurement_noise_min, args.measurement_noise_max).numpy(),args.band_limit)
-          if args.range_theta == None:
-            true_density = true_distribution.density()
+          if non_gaussian:
+            noise_ = heteroscedastic_noise(ground_truth, args.measurement_noise_min, args.measurement_noise_max)
+            mean_ = args.alpha/(args.alpha + args.beta)
+            alpha_, beta_ = mean_var(mean_, noise_)
+            true_distribution = BetaDistribution(alpha_, beta_)
+            true_density = true_distribution.density_translated(ground_truth,args.band_limit)
+            true_density_plot = true_distribution.density_translated(ground_truth,args.samples_size)
+
           else:
-            true_density = true_distribution.density_local(args.range_theta)
+              true_distribution = VonMissesDistribution(ground_truth.numpy(),heteroscedastic_noise(ground_truth, args.measurement_noise_min, args.measurement_noise_max).numpy(),args.band_limit)
+              if args.range_theta == None:
+                true_density = true_distribution.density()
+              else:
+                true_density = true_distribution.density_local(args.range_theta)
           kl_div_tot += kl_divergence_s1(true_density, predicted_density)
           ece = expected_calibration_error(predicted_density, true_density, M=10)
           ece_tot += ece
           sharpness += sharpness_discrete(predicted_density)
           true_nll += true_distribution.negative_loglikelihood(measurements.numpy())
           wd_tot += wasserstein_distance(predicted_density, true_density)
+          nll_tot += nll.item()
+          if torch.isnan(wd_tot).any( )or torch.isnan(kl_div_tot).any() or torch.isinf(wd_tot).any( ) or torch.isinf(kl_div_tot).any( ):
+            print("Nan or Inf detected in metrics")
+            # pdb.set_trace()
           if epoch % 50 == 0 and i  == sample_batch:
             indices = np.random.choice(args.batch_size, 5, replace=False)
             for j in indices:
@@ -330,7 +380,10 @@ def main(args):
                 ax = plot_circular_distribution(energy[j],legend="predicted distribution",ax=ax)
               else:
                 ax = plot_circular_distribution(energy[j],legend="predicted distribution",mean=ground_truth[j,0],range_theta=args.range_theta,ax=ax)
-              ax = plotting_von_mises(ground_truth[j],heteroscedastic_noise(ground_truth[j], args.measurement_noise_min, args.measurement_noise_max).item()**2, args.band_limit,ax,"true distribution")
+              if non_gaussian:
+                ax = plot_beta_distribution(true_density_plot[j],args.samples_size, ax, "true distribution")
+              else:
+                ax = plotting_von_mises(ground_truth[j],heteroscedastic_noise(ground_truth[j], args.measurement_noise_min, args.measurement_noise_max).item()**2, args.band_limit,ax,"true distribution")
               ax.plot(torch.cos(measurements[j]),torch.sin(measurements[j]),'o',label="measurement data")
               ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
               ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
@@ -339,6 +392,13 @@ def main(args):
               plt.savefig(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.png"), format='png', dpi=300)
               # plt.show()
               plt.close()
+              plot_dict = {}
+              plot_dict["groundtruth"] = ground_truth[j]
+              plot_dict["measurement"] = measurements[j]
+              plot_dict["true_density_plot"] = true_density_plot[j]
+              with open(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.pkl"), "wb") as f:
+                  pkl.dump(plot_dict, f)
+                  print(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.pkl"))
             plt.bar(bin_centers.numpy(), hist.numpy(), width=(bin_edges[1] - bin_edges[0]).item(), edgecolor='black', align='center')
             plt.axvline(x=mae_mu, color='r', linestyle='-', label='MAE')
             plt.legend()
@@ -370,9 +430,8 @@ def main(args):
         if args.gaussian_parameterisation:
           metrics['RMSE Cov'] = rmse_cov / len(train_loader)
         wandb.log(metrics)
-        print("Training finished!")
+    print("Training finished!")
     print(f"Training took {time.time() - start_time} seconds")
-    
     # Log all the generated images to wandb
     for img_file in os.listdir(logging_path):
         if img_file.endswith(".png"):
@@ -391,10 +450,10 @@ if __name__ == '__main__':
   if torch.cuda.is_available():
     torch.cuda.manual_seed(args.seed)
   run = wandb.init(project="Diff-HEF",group="S1",entity="korra141",
-          tags=["S1","UncertainityEstimation","HeteroscedasticNoise"],
+          tags=["S1","UncertainityEstimation","HeteroscedasticNoise","BetaNoise"],
           name="S1-UncertainityEstimation",
           config=args)
-  artifact = wandb.Artifact("UE_script_hetero", type="script")
+  artifact = wandb.Artifact("UE_script_hetero_beta", type="script")
   artifact.add_file(__file__)
   run.log_artifact(artifact)
   main(args)

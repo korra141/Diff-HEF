@@ -73,6 +73,8 @@ def predicted_residual_error(p, q, bins=10):
     Both p and q should be torch tensors of the same shape.
     """
     residual_error = absolute_error_s1(p, q)
+    if torch.isnan(residual_error).any():
+        print("residual error is nan")
     hist = torch.histc(residual_error, bins=bins)
     min_val, max_val = torch.min(residual_error), torch.max(residual_error)
     bin_edges = torch.linspace(min_val, max_val, 20 + 1)
@@ -85,7 +87,7 @@ def expected_calibration_error_continuous(y_true, y_pred_cdf, n_bins=10):
     Compute the Expected Calibration Error (ECE) for continuous distributions.
     
     Args:
-        y_true (torch.Tensor): Observed data points of shape (n_samples,).
+        y_true (torch.Tensor): Values of the true distribution pdf
         y_pred_cdf (torch.Tensor): Predicted CDF values corresponding to y_true, shape (n_samples,).
         n_bins (int): Number of bins for the calibration evaluation.
     
@@ -135,6 +137,18 @@ def expected_calibration_error_continuous(y_true, y_pred_cdf, n_bins=10):
 # print(f"Expected Calibration Error (ECE): {ece_score}")
 
 def expected_calibration_error(predicted_distribution, true_distribution, M=5):
+    """
+    Computes the Expected Calibration Error (ECE) between the predicted and true distributions.
+    ECE is a scalar measure of how well the predicted probabilities are calibrated with respect to the true outcomes.
+    It is calculated by partitioning the predictions into M bins and computing the weighted average of the absolute 
+    difference between the accuracy and confidence of each bin.
+    Args:
+        predicted_distribution (torch.Tensor): A tensor of predicted probabilities with shape (batch_size, num_samples).
+        true_distribution (torch.Tensor): A tensor of true probabilities with shape (batch_size, num_samples).
+        M (int, optional): The number of bins to partition the predicted probabilities into. Default is 5.
+    Returns:
+        torch.Tensor: A tensor containing the ECE for each batch element.
+    """
     bin_boundaries = torch.linspace(0, 1, M + 1)
     bin_lowers = bin_boundaries[:-1]
     bin_uppers = bin_boundaries[1:]
@@ -163,6 +177,46 @@ def expected_calibration_error(predicted_distribution, true_distribution, M=5):
 
     return torch.mean(ece)
 
+def expected_calibration_error_check(predicted_distribution, true_distribution, M=5):
+    """
+    Computes the Expected Calibration Error (ECE) between the predicted and true distributions.
+    """
+    bin_boundaries = torch.linspace(0, 1, M + 1)
+    bin_lowers = bin_boundaries[:-1]
+    bin_uppers = bin_boundaries[1:]
+    
+    batch_size, num_samples = predicted_distribution.shape
+    ece = torch.zeros(batch_size, device=predicted_distribution.device)
+
+    for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
+        # Mask for samples in the current bin
+        in_bin_pred = (predicted_distribution > bin_lower) & (predicted_distribution <= bin_upper)
+        in_bin_true = (true_distribution > bin_lower) & (true_distribution <= bin_upper)
+        matched_samples = in_bin_pred & in_bin_true
+        
+        # Count samples in the bin
+        n_in_bin = in_bin_pred.sum(dim=-1)
+        
+        # Avoid division by zero
+        non_zero_bins = n_in_bin > 0
+        
+        # Calculate accuracy and confidence
+        accuracy_in_bin = torch.zeros_like(ece)
+        avg_confidence_in_bin = torch.zeros_like(ece)
+        
+        if non_zero_bins.any():
+            accuracy_in_bin[non_zero_bins] = matched_samples.sum(dim=-1)[non_zero_bins] / n_in_bin[non_zero_bins]
+            masked_tensor = torch.where(in_bin_pred, predicted_distribution, torch.tensor(0.0))
+            avg_confidence_in_bin[non_zero_bins] = masked_tensor.view(batch_size, -1).mean(dim=-1)[non_zero_bins]
+        
+        # Weighted absolute difference
+        ece += torch.where(
+            non_zero_bins,
+            torch.abs(avg_confidence_in_bin - accuracy_in_bin) * (n_in_bin / num_samples),
+            torch.tensor(0.0, device=ece.device)
+        )
+    
+    return ece.mean()
 def sharpness_discrete(pred_probs):
     """
     Compute sharpness for discrete distributions based on entropy.

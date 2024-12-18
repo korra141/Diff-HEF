@@ -198,7 +198,7 @@ def plot_s1_energy(energy_samples_list,
         f.append(prob)
     return plot_s1_func(f, legend, ax, plot_type)
 
-def plot_beta_distribution(alpha, beta, theta_new, grid_size, ax, legend):
+def plot_beta_distribution(beta_pdf, grid_size, ax, legend):
   """
   Plots a beta distribution on a circle.
 
@@ -211,14 +211,14 @@ def plot_beta_distribution(alpha, beta, theta_new, grid_size, ax, legend):
   """
 
   theta = np.linspace(0, 2 * np.pi, grid_size, endpoint=False)
-  if theta_new is not None:
-    theta = (theta + theta_new) % (2 * np.pi)
+  # if theta_new is not None:
+  #   theta = (theta + theta_new) % (2 * np.pi)
   
-  beta_dist = BetaDistribution(alpha, beta)
-  beta_pdf = beta_dist.pdf(theta/(2 * np.pi))
+  # beta_dist = BetaDistribution(alpha, beta)
+  # beta_pdf = beta_dist.pdf(theta/(2 * np.pi))
   radius = 1.0
 
-  prob_grid_r = beta_pdf + radius
+  prob_grid_r = beta_pdf.detach().numpy() + radius
 
   a = radius * np.cos(theta)
   b = radius * np.sin(theta)

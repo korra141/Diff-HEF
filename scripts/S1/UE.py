@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument('--hidden_size', type=int, default=10, help='Number of neurons in the hidden layer')
     # parser.add_argument('--learning_rate', type=float, default=0.0001, help='Learning rate')
     parser.add_argument('--num_epochs', type=int, default=500, help='Number of epochs')
-    parser.add_argument('--band_limit', type=int, default=100, help='Band limit')
+    parser.add_argument('--band_limit', type=int, default=30, help='Band limit')
     parser.add_argument('--batch_size', type=int, default=100, help='Batch size')
     parser.add_argument('--n_samples', type=int, default=1000, help='Number of samples')
     parser.add_argument('--trajectory_length', type=int, default=100, help='Length of each trajectory')
@@ -264,9 +264,9 @@ def main(args):
         lambda_ = lambda_scheduler(epoch)
         print("loss regulariser",lambda_)
       start_epoch_time = time.time()
-      val_metrics = validate(model, val_loader, args, hed,logging_path,epoch)
-      if args.wandb:
-        wandb.log(val_metrics,commit=False)
+      # val_metrics = validate(model, val_loader, args, hed,logging_path,epoch)
+      # if args.wandb:
+      #   wandb.log(val_metrics,commit=False)
       sample_batch = np.random.choice(len(train_loader),1).item()
       for i, (ground_truth, measurements) in enumerate(train_loader):
           if args.gaussian_parameterisation:
@@ -318,33 +318,33 @@ def main(args):
           true_nll += true_distribution.negative_loglikelihood(measurements.numpy())
           kl_div_tot += kl_divergence_s1(true_density, predicted_density)
           wd_tot += wasserstein_distance(predicted_density, true_density)
-          if args.wandb and epoch % 50 == 0 and i == sample_batch:
-            indices = np.random.choice(args.batch_size, 5, replace=False)
-            for j in indices:
-              fig, ax = plt.subplots()
-              if args.range_theta == None and args.gaussian_parameterisation:
-                ax = plotting_von_mises(mu_[j],cov_.numpy()[j], args.band_limit,ax,"predicted distribution")
-              elif args.range_theta == None and args.gaussian_parameterisation == 0:
-                ax = plot_circular_distribution(energy[j],legend="predicted distribution",ax=ax)
-              else:
-                ax = plot_circular_distribution(energy[j],legend="predicted distribution",mean=ground_truth[j,0],range_theta=args.range_theta,ax=ax)
-              ax = plotting_von_mises(ground_truth[j],args.measurement_noise**2 , args.band_limit,ax,"true distribution")
-              ax.plot(torch.cos(measurements[j]),torch.sin(measurements[j]),'o',label="measurement data")
-              ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
-              ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
-              ax.legend(bbox_to_anchor=(0.85, 1), loc='upper left', fontsize='x-small')
-              ax.set_aspect('equal')
-              plt.savefig(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.png"), format='png', dpi=300)
-              # plt.show()
-              plt.close()
-            plt.bar(bin_centers.numpy(), hist.numpy(), width=(bin_edges[1] - bin_edges[0]).item(), edgecolor='black', align='center')
-            plt.axvline(x=mae_mu, color='r', linestyle='-', label='MAE')
-            plt.legend()
-            plt.xlabel('Value')
-            plt.ylabel('Count')
-            plt.title('Histogram predicted residual error')
-            plt.savefig(os.path.join(logging_path, f"training_histogram_epoch_{epoch}_batch_{i}.png"), format='png', dpi=300)
-            plt.close()
+          # if args.wandb and epoch % 50 == 0 and i == sample_batch:
+          #   indices = np.random.choice(args.batch_size, 5, replace=False)
+          #   for j in indices:
+          #     fig, ax = plt.subplots()
+          #     if args.range_theta == None and args.gaussian_parameterisation:
+          #       ax = plotting_von_mises(mu_[j],cov_.numpy()[j], args.band_limit,ax,"predicted distribution")
+          #     elif args.range_theta == None and args.gaussian_parameterisation == 0:
+          #       ax = plot_circular_distribution(energy[j],legend="predicted distribution",ax=ax)
+          #     else:
+          #       ax = plot_circular_distribution(energy[j],legend="predicted distribution",mean=ground_truth[j,0],range_theta=args.range_theta,ax=ax)
+          #     ax = plotting_von_mises(ground_truth[j],args.measurement_noise**2 , args.band_limit,ax,"true distribution")
+          #     ax.plot(torch.cos(measurements[j]),torch.sin(measurements[j]),'o',label="measurement data")
+          #     ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
+          #     ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
+          #     ax.legend(bbox_to_anchor=(0.85, 1), loc='upper left', fontsize='x-small')
+          #     ax.set_aspect('equal')
+          #     plt.savefig(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.png"), format='png', dpi=300)
+          #     # plt.show()
+          #     plt.close()
+          #   plt.bar(bin_centers.numpy(), hist.numpy(), width=(bin_edges[1] - bin_edges[0]).item(), edgecolor='black', align='center')
+          #   plt.axvline(x=mae_mu, color='r', linestyle='-', label='MAE')
+          #   plt.legend()
+          #   plt.xlabel('Value')
+          #   plt.ylabel('Count')
+          #   plt.title('Histogram predicted residual error')
+          #   plt.savefig(os.path.join(logging_path, f"training_histogram_epoch_{epoch}_batch_{i}.png"), format='png', dpi=300)
+          #   plt.close()
 
 
         # Backward pass and optimization
@@ -356,7 +356,9 @@ def main(args):
       print(f"Epoch {epoch+1} took {time.time() - start_epoch_time} seconds")
       print(f'Epoch [{epoch+1}/{args.num_epochs}], Loss: {loss_tot/len(train_loader):.4f}, RMSE Mu: {rmse_mu_tot/len(train_loader):.4f}, MAE Mu: {mae_mu_tot/len(train_loader):.4f}, KL Divergence: {kl_div_tot/len(train_loader):.4f}')
       print(f"ECE: {ece_tot/len(train_loader):.4f}, Sharpness: {sharpness/len(train_loader):.4f}")
-      metrics = {
+      
+      if args.wandb and epoch % 50 == 0:
+        metrics = {
           'Epoch': epoch + 1,
           'NLL' : nll_tot / len(train_loader),
           'True NLL': true_nll / len(train_loader),
@@ -367,20 +369,25 @@ def main(args):
           'ECE': ece_tot / len(train_loader), 
           'Sharpness': sharpness / len(train_loader),
           'Wasserstein Distance': wd_tot / len(train_loader)}
-      if args.gaussian_parameterisation:
-        metrics['RMSE Cov'] = rmse_cov / len(train_loader)
-      if args.wandb:
+        if args.gaussian_parameterisation:
+          metrics['RMSE Cov'] = rmse_cov / len(train_loader)
         wandb.log(metrics)
     print("Training finished!")
+    # Save the model checkpoint
+    model_save_path = os.path.join(logging_path, 'model.pth')
+    torch.save(model.state_dict(), model_save_path)
+    print(f"Model saved to {model_save_path}")
+    wandb.save(model_save_path)
+    
     print(f"Training took {time.time() - start_time} seconds")
     # Log all the generated images to wandb
-    if args.wandb:
-      print("Logging images to wandb")
-      start_wandb_time = time.time()
-      for img_file in os.listdir(logging_path):
-          if img_file.endswith(".png"):
-              wandb.log({f"{img_file}": wandb.Image(os.path.join(logging_path, img_file))})
-      print(f"Logging images to wandb took {time.time() - start_wandb_time} seconds")
+    # if args.wandb:
+    #   print("Logging images to wandb")
+    #   start_wandb_time = time.time()
+    #   for img_file in os.listdir(logging_path):
+    #       if img_file.endswith(".png"):
+    #           wandb.log({f"{img_file}": wandb.Image(os.path.join(logging_path, img_file))})
+    #   print(f"Logging images to wandb took {time.time() - start_wandb_time} seconds")
     
 
 

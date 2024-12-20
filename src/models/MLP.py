@@ -41,21 +41,27 @@ class SimpleModel(nn.Module):
             nn.ReLU(),
             nn.Linear(16, 4)
         )
+        self.mu_out = nn.Linear(4, 2)
+
+        # Uncertainty Netowork
+        self.var_out = nn.Linear(4, 2)
+
         self._initialize_weights()
 
     def forward(self, x):
-        y_pred = self.model(x)
-        mu_x = y_pred[:,0:1] %(2 * math.pi)
-        mu_y = y_pred[:,1:2] %(2 * math.pi)
-        logcov_x = y_pred[:,2:3]
-        logcov_y = y_pred[:,3:4]
-        epsilon = torch.tensor(-1e-2)  # Small value to avoid zero covariance
-        logcov_x = torch.where(logcov_x < epsilon, epsilon, logcov_x)
-        logcov_y = torch.where(logcov_y < epsilon, epsilon, logcov_y)
-        return mu_x, mu_y, logcov_x, logcov_y
+        h = self.model(x)
+        mu = self.mu_out(h)
+        logcov = self.var_out(h)
+        # epsilon = torch.tensor([1e-8,1e-8]) # Lower bound for variance
+        # max_value = torch.tensor([1e+3, 1e+3]) # Upper bound for variance
+        # cov = torch.where(cov < epsilon, epsilon, cov)
+        # cov = torch.where(cov > max_value, max_value, cov)
+        cov = torch.exp(logcov)
+        return mu,cov
 
     def _initialize_weights(self):
         for m in self.modules():
+            print(m)
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
                 if m.bias is not None:

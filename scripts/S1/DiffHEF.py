@@ -19,13 +19,20 @@ import os
 import wandb
 import sys
 import pdb
+import pickle
 from torchinterp1d import interp1d
+import concurrent.futures
+import time
 
 base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(base_path)
 
 from src.utils.visualisation import plot_s1_energy, plotting_von_mises, generate_gif
-
+from src.filter.EKF import ExtendedKalmanFilter
+from src.distributions.S1.WrappedNormalDitribution import VonMissesDistribution_torch
+from src.utils.metrics import root_mean_square_error_s1,absolute_error_s1
+from scripts.S1.LSTM import LSTMFilter
+from src.utils.metrics import kl_divergence_k, kl_divergence_s1
 
 def generating_data_S1(batch_size, n_samples, trajectory_length, measurement_noise, recreate=False,step=0.1, shuffle_flag=True):
     """Generates training data for a system with circular motion.
@@ -41,7 +48,7 @@ def generating_data_S1(batch_size, n_samples, trajectory_length, measurement_noi
     Returns:
       Flattened pose and noisy measurement data in a TensorDataset.
     """
-    data_path = os.path.join(base_path, 'data', f's1_simple_dataset_{measurement_noise}.pt')
+    data_path = os.path.join(base_path, 'data', f's1_filter_{n_samples}_{trajectory_length}_{measurement_noise}.pt')
     if recreate or not os.path.exists(data_path):
         print('Generating Data and Saving')
         starting_positions = np.linspace(0, 2 * np.pi, n_samples, endpoint=False)
@@ -69,13 +76,16 @@ def generating_data_S1(batch_size, n_samples, trajectory_length, measurement_noi
 
     # Split the dataset into training and validation sets
     train_size = int(0.8 * len(train_dataset))
-    val_size = len(train_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+    test_size = int(0.5*(len(train_dataset) - train_size))
+    val_size = int(0.5*(len(train_dataset) - train_size))
+    print(train_size, test_size, val_size)
+    train_dataset, test_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, test_size, val_size])
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, drop_last=True, shuffle=shuffle_flag)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, drop_last=True, shuffle=False)
-    
-    return train_loader, val_loader
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, drop_last=True, shuffle=False)
+
+    return train_loader, test_loader, val_loader
     
 
 
@@ -155,6 +165,51 @@ def analytical_energy(mu, cov, band_limit):
     process_energy = unnormalized_von_mises_log_prob(samples, mu, kappa)
     return process_energy
 
+class SimpleModel(nn.Module):
+    def __init__(self):
+        super(SimpleModel, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(1, 8),
+            nn.ReLU(),
+            nn.Linear(8, 2)
+        )
+        # self.mu = nn.Linear(8,1)
+        # self.logcov = nn.Linear(8,1)
+        self._initialize_weights()
+
+    def forward(self, x):
+        h = self.model(x)
+        mu = h[:,0:1] %(2 * math.pi)
+        logcov = h[:,1:2]
+        # epsilon = torch.tensor(-1e-2)  # Small value to avoid zero covariance
+        # logcov = torch.where(logcov < epsilon, epsilon, logcov)
+        return mu, logcov
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+# class MeasurementModel(nn.Module):
+#     def __init__(self, input_size1, input_size2, hidden_size, output_size):
+#         super(MeasurementModel, self).__init__()
+#         self.fc1_1 = nn.Linear(input_size1, hidden_size)
+#         self.fc1_2 = nn.Linear(input_size2, hidden_size)
+#         self.relu = nn.ReLU()
+#         self.fc2 = nn.Linear(2 * hidden_size, output_size)
+#         self.tanh = nn.Tanh()
+#         self.sigmoid = nn.Sigmoid()
+
+#     def forward(self, x1, x2):
+#         x1  = x1.squeeze(-1)
+#         x1 = torch.tile(x1[:, None],(1,x2.shape[-1]))
+#         out1 = self.fc1_1(x1)
+#         out2 = self.fc1_2(x2)
+#         out = self.relu(torch.cat((out1, out2), dim=1))
+#         out = self.fc2(out)
+#         return out
 
 class MeasurementModel(nn.Module):
     def __init__(self, input_size1, input_size2, hidden_size, output_size):
@@ -171,7 +226,7 @@ class MeasurementModel(nn.Module):
         out2 = self.fc1_2(x2)
         out = self.sigmoid(torch.cat((out1, out2), dim=1))
         out = self.fc2(out)
-        return out + x1
+        return out 
     
 class EnergyNetwork(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -184,7 +239,7 @@ class EnergyNetwork(nn.Module):
         out = self.fc1(x)
         out = self.relu(out)
         out = self.fc2(out)
-        return out
+        return out + x
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
@@ -192,9 +247,9 @@ def init_weights(m):
         nn.init.zeros_(m.bias)
 
 
-class HEFilter(nn.Module):
+class HarmonicExponentialDistribution(nn.Module):
     def __init__(self, band_limit,step_size=0.1):
-        super(HEFilter, self).__init__()
+        super(HarmonicExponentialDistribution, self).__init__()
         self.band_limit = band_limit
         self.step_size = step_size
 
@@ -212,13 +267,13 @@ class HEFilter(nn.Module):
         return eta, energy
 
     def convert_moments_eta_energy(self, moments):
-        prob = torch.fft.ifft(moments, dim=-1)
+        prob_unnorm = torch.fft.ifft(moments, dim=-1)
         ln_z_ = torch.unsqueeze(torch.real(torch.log(2 * math.pi * moments[:, 0] / self.band_limit)), 1)
-        prob_real = torch.real(prob)
+        prob_real = torch.real(prob_unnorm)
         prob_process = torch.where(prob_real > 0, prob_real, 1e-8)
-        energy = torch.log(prob_process)
-        eta = torch.fft.fft(energy, dim=-1)
-        return eta, energy
+        energy_norm = torch.log(prob_process) - ln_z_
+        eta = torch.fft.fft(energy_norm, dim=-1)
+        return eta, energy_norm
 
     def convert_from_energy_eta(self, energy_samples):
         ln_z_ = self.normalisation_constant(energy_samples)
@@ -274,212 +329,637 @@ class HEFilter(nn.Module):
         mean = torch.sum(density* grid * diff, dim=-1)
         return mean.unsqueeze(-1)
 
+def validation(args, val_loader, measurement_model, epoch, folder_path):
+    measurement_model.eval()
+    validation_path = os.path.join(folder_path, "hef", "validation")
+    os.makedirs(validation_path, exist_ok=True)
+    hef = HarmonicExponentialDistribution(args.band_limit, args.step_size)
+    hef_analytical = HarmonicExponentialDistribution(args.sample_size, args.step_size)
+    nll_posterior_tot = 0
+    nll_posterior_tot_true = 0
+    for i, (ground_truth, measurements) in enumerate(val_loader):
+        prior_hef = analytical_energy(ground_truth[:, 0], args.initial_cov, args.band_limit)
+        prior_true = analytical_energy(ground_truth[:, 0], args.initial_cov, args.sample_size)
+        control = torch.ones((args.batch_size, 1)) * args.step_size + torch.normal(0, args.noise_p, size=(args.batch_size, 1))
+        control_true = torch.ones((args.batch_size, 1)) * args.step_size
+        for j in range(1, args.traj_len):
+            nll_posterior_hef, nll_likelihood, energy_posterior,energy_z, energy_bel_x_t_bar, prior_hef = HarmonicExponentialFilter(control, measurements[:, j], ground_truth[:, j], hef, args.noise_p ** 2, args.initial_cov, prior_hef,  args.input_cov_z, False, measurement_model)
+            nll_posterior_true, nll_likelihood_true, energy_posterior_true,energy_z_true, energy_bel_x_t_bar_true, prior_true = HarmonicExponentialFilter(control_true, measurements[:, j], ground_truth[:, j], hef_analytical, args.noise_p ** 2, args.initial_cov, prior_true, args.noise_z ** 2, False,None)
+            nll_posterior_tot += nll_posterior_hef.item()
+            if epoch % 50 == 0 and i == 0:
+                    # os.makedirs(epoch_folder_path, exist_ok=True)
+                    if j % 5 == 0:
+                        ax_1 = plot_distributions(energy_posterior_true, energy_z_true, energy_bel_x_t_bar_true, ground_truth,
+                                measurements, 0, j, 0, "true", folder_path,None,False)
+                        plot_distributions(energy_posterior, energy_z, energy_bel_x_t_bar, ground_truth,
+                                           measurements, 0, j, epoch, "validation_hef", validation_path ,ax_1)
+    # print(f"Validation NLL: {nll_posterior_tot / (len(val_loader)* args.traj_len)}")
+    # print(f"Validation NLL True: {nll_posterior_tot_true / (len(val_loader)* args.traj_len)}")
+    return nll_posterior_tot / (len(val_loader)* (args.traj_len-1))
 
-# def train(args, measurement_model,train_loader, folder_path):
-#     training_path = os.path.join(folder_path, "training")
-#     os.makedirs(training_path, exist_ok=True)
-#     optimizer = optim.Adam(measurement_model.parameters(), lr=args.learning_rate)
-#     hef = HEFilter(args.band_limit)
-#     for epoch in range(args.num_epochs):
-#         print(f"Training at epoch {epoch}")
-#         loss_tot = 0
-#         nll_posterior_tot = 0
-#         nll_likelihood_tot = 0
-#         # epoch_folder_path = os.path.join(folder_path, f"epoch_{epoch}")
-#         for i, (measurements, ground_truth) in enumerate(train_loader):
-#             prior = analytical_energy(ground_truth[:, 0], args.initial_cov, args.band_limit)
-#             control = torch.ones((args.batch_size, 1)) * args.step_size + torch.normal(0, args.noise_p,
-#                                                                              size=(args.batch_size, 1))  # Fixed Control
-#             for j in range(args.traj_len):
-#                 energy_true_z = analytical_energy(measurements[:, j], args.input_cov_z, args.band_limit)
-#                 energy_process = analytical_energy(control, args.noise_p ** 2, args.band_limit)
+def validate_ekf(args, val_loader, measurement_model, epoch, folder_path):
+    measurement_model.eval()
+    validation_path = os.path.join(folder_path, "ekf", "validation")
+    os.makedirs(validation_path, exist_ok=True)
+    initial_cov_batch = torch.ones((args.batch_size, 1)) * args.initial_cov
+    process_cov_batch = torch.ones((args.batch_size, 1)) * (args.noise_p ** 2)
+    
+    ekf_diff = ExtendedKalmanFilter(initial_cov_batch, process_cov_batch)
+    ekf_true = ExtendedKalmanFilter(initial_cov_batch, process_cov_batch)
+    control_true = torch.ones((args.batch_size, 1)) * args.step_size # Fixed Control
+    ekf_true.set_step(control_true)
 
-#                 # Predict Step
-#                 eta_bel_x_t_bar, energy_bel_x_t_bar = hef.predict(prior, energy_process)
-#                 mean_energy_bel_x_t_bar = hef.mean_hef(energy_bel_x_t_bar)
-
-#                 # P(z_t | x_t) Measurement Step
-#                 energy_pred_z = measurement_model(mean_energy_bel_x_t_bar)
-
-#                 # Calculate Posterior
-#                 with torch.no_grad():
-#                     energy_posterior = hef.update(eta_bel_x_t_bar, energy_pred_z)
-
-#                 # Current posterior is prior for the next step (j + 1)
-#                 prior = energy_posterior
-
-#                 # Calculate loss
-#                 # loss = total_loss(energy_posterior, energy_pred_z, ground_truth[:, j], args.band_limit, args.current_lambda)
-#                 loss = loss_fn(energy_pred_z, ground_truth[:, j], args.band_limit)
-#                 nll_posterior = loss_fn(energy_posterior, ground_truth[:, j], args.band_limit)
-
-#                 # Update Measurement Model
-#                 optimizer.zero_grad()
-#                 loss.backward()
-#                 optimizer.step()
-
-#                 loss_tot += loss.item()
-#                 nll_posterior_tot += nll_posterior.item()
-#                 # nll_likelihood_tot += nll_likelihood.item()
-
-#                 if epoch % 10 == 0 and i == 0:
-#                     # os.makedirs(epoch_folder_path, exist_ok=True)
-#                     if j % 5 == 0:
-#                         plot_distributions(energy_posterior, energy_pred_z, energy_bel_x_t_bar, ground_truth,
-#                                            measurements, 0, j, epoch, "training_hef", training_path)
-#         print(f"Epoch {epoch} Loss: {loss_tot / (len(train_loader)* args.traj_len)} NLL Posterior: {nll_posterior_tot / (len(train_loader) * args.traj_len)}")
-#         model_save_path = os.path.join(training_path, 'model.pth')
-#         torch.save(measurement_model.state_dict(), model_save_path)
-#         print(f"Model saved to {model_save_path}")
-
-#         return measurement_model
-
-
-
-def main(args):
-    # measurement_model = MeasurementModel(band_limit, band_limit, hidden_size, band_limit)
-    measurement_model = EnergyNetwork(1, 10, args.band_limit)
-    train_loader,test_loader = generating_data_S1(args.batch_size, args.n_trajs, args.traj_len, args.noise_z, False, args.step_size, True)
-    if args.model_path is not None and os.path.exists(args.model_path):
-        print('Loading pre-trained model')
-        measurement_model.load_state_dict(torch.load(args.model_path))
-    else:
-        print('Initializing new model')
-        measurement_model.apply(init_weights)
-        # measurement_model = train(args, measurement_model,train_loader, folder_path)
+    nll_posterior_tot = 0
+    rmse_tot = 0
+    nll_likelihood_tot = 0
+    nll_posterior_tot_true = 0
+    rmse_tot_true = 0
+    kl_ekf_diff = 0
+    sample_batch = 0
+    for i, (ground_truth, measurements) in enumerate(val_loader):
+        control = torch.ones((args.batch_size, 1)) * args.step_size + torch.normal(0, args.noise_p, size=(args.batch_size, 1))
+        ekf_diff.set_step(control_true)
+        ekf_diff.set_initial_state(ground_truth[:, 0])
+        ekf_true.set_initial_state(ground_truth[:, 0])
+        ekf_true.P = initial_cov_batch
+        ekf_diff.P = initial_cov_batch
+        for j in range(1, args.traj_len):
+            # EKF
+            rmse_ekf_true, nll_posterior_ekf_true, nll_likelihood_efk_true,  mu_ekf_post_true, cov_ekf_post_true ,mu_ekf_pred_true, cov_ekf_pred_true, mu_mm_true, cov_mm_true = EKF(ekf_true, measurements[:, j], ground_truth[:, j], args.noise_z **2 , False, None)
         
-    hef = HEFilter(args.band_limit, args.step_size)
-    c_time = time.strftime("%Y_%m_%d_%H_%M_%S")
-    folder_path = f"{base_path}/logs/s1_filter/{c_time}"
-    os.makedirs(folder_path, exist_ok=True)
-    print(f"Saving logs to {folder_path}")
+            rmse_ekf_diff, nll_posterior_ekf_diff, nll_likelihood_ekf_diff, mu_ekf_post_diff, cov_ekf_post_diff ,mu_ekf_pred_diff, cov_ekf_pred_diff, mu_mm_likelihood, cov_mm_likelihood  = EKF(ekf_diff, measurements[:, j], ground_truth[:, j], args.input_cov_z, False, measurement_model)
+            
+            # Metrics
+            nll_posterior_tot += nll_posterior_ekf_diff.item()
+        
+            if epoch % 50 == 0 and i == 0:
+                    # os.makedirs(epoch_folder_path, exist_ok=True)
+                    if j % 5 == 0:
+                        ax_1 = plot_ekf(mu_ekf_pred_true, cov_ekf_pred_true, mu_ekf_post_true, cov_ekf_post_true, mu_mm_true, cov_mm_true, measurements, ground_truth, validation_path, sample_batch, j, epoch,'true', None,save=False)
+          
+                        plot_ekf(mu_ekf_pred_diff.detach(), cov_ekf_pred_diff.detach(), mu_ekf_post_diff.detach(), cov_ekf_post_diff.detach(), mu_mm_likelihood.detach(), cov_mm_likelihood.detach(),  measurements, ground_truth, validation_path, sample_batch, j,epoch, 'val-diff-ekf', ax_1)
+                        plt.close()
+    return nll_posterior_tot / (len(val_loader)* args.traj_len)
+
+def train_ekf(args,train_loader, val_loader, folder_path):
+    training_path = os.path.join(folder_path, "ekf", "training")
+    os.makedirs(training_path, exist_ok=True)
+
+    measurement_model = SimpleModel()
+    optimizer = optim.Adam(measurement_model.parameters(), lr=args.learning_rate)
+    control_true = torch.ones((args.batch_size, 1)) * args.step_size # Fixed Control
+    
+    initial_cov_batch = torch.ones((args.batch_size, 1)) * args.initial_cov
+    process_cov_batch = torch.ones((args.batch_size, 1)) * (args.noise_p ** 2)
+    
+    ekf_diff = ExtendedKalmanFilter(initial_cov_batch, process_cov_batch)
+    ekf_true = ExtendedKalmanFilter(initial_cov_batch, process_cov_batch)
+    ekf_true.set_step(control_true)
+
+    # sample_batch =  np.random.choice(args.batch_size,1).item()
+    nll_posterior_list = []
+    nll_true_list = []
+    nll_pred_z_list = []
+    loss_val_list = []
+    loss_list = []
+
+    sample_batch = 0
+    for epoch in range(args.num_epochs_ekf):
+        loss_tot = 0
+        nll_posterior_tot = 0
+        nll_pred_z_tot = 0
+        rmse_tot = 0
+        nll_likelihood_tot = 0
+        nll_posterior_tot_true = 0
+        rmse_tot_true = 0
+        kl_ekf_diff = 0
+        val_loss = validate_ekf(args, val_loader, measurement_model, epoch, folder_path)
+        loss_val_list.append(val_loss)
+        # learning_rate_decay = args.learning_rate + (args.learning_rate_end - args.learning_rate) * (1 - np.exp((-args.lr_factor * epoch / args.num_epochs)))
+        # print("learning_rate",learning_rate_decay)
+        # for param_group in optimizer.param_groups:
+        #   param_group['lr'] = learning_rate_decay
+        # alpha = min(1.0, max(0.0, (epoch - 300) / 100)) 
+        # lambda_ = torch.tensor(1 - np.exp(-5 * ((epoch - 300) / args.num_epochs_ekf)))
+        # print(f"Alpha {alpha}, Lambda {lambda_}")
+        for i, (ground_truth,measurements) in enumerate(train_loader):
+            control = torch.ones((args.batch_size, 1)) * args.step_size + torch.normal(0, args.noise_p, size=(args.batch_size, 1))
+            ekf_diff.set_step(control_true)
+            ekf_diff.set_initial_state(ground_truth[:, 0])
+            ekf_true.set_initial_state(ground_truth[:, 0])
+            ekf_true.P = initial_cov_batch
+            ekf_diff.P = initial_cov_batch
+            for j in range(1,args.traj_len):
+        
+                # EKF 
+                ekf_diff.x = ekf_diff.x.detach()
+                ekf_diff.P = ekf_diff.P.detach()
+                rmse_ekf_diff, nll_posterior_ekf_diff, nll_likelihood_ekf_diff, mu_ekf_post_diff, cov_ekf_post_diff ,mu_ekf_pred_diff, cov_ekf_pred_diff, mu_mm_likelihood, cov_mm_likelihood  = EKF(ekf_diff, measurements[:, j], ground_truth[:, j],args.noise_z **2, False, measurement_model)
+        
+                rmse_ekf_true, nll_posterior_ekf_true, nll_likelihood_efk_true,  mu_ekf_post_true, cov_ekf_post_true ,mu_ekf_pred_true, cov_ekf_pred_true, mu_mm_true, cov_mm_true = EKF(ekf_true, measurements[:, j], ground_truth[:, j], args.noise_z **2 , False, None)
+                cov_constant = torch.ones_like(cov_mm_likelihood) * 0.02
+                # loss = (1-lambda_)*nll_likelihood_ekf_diff + lambda_ * nll_posterior_ekf_diff
+                loss = nll_likelihood_ekf_diff
+                # Metrics
+                nll_posterior_tot += nll_posterior_ekf_diff.detach().item()
+                rmse_tot += rmse_ekf_diff.item()
+                
+                true_density, grid_ = density_gaussian(mu_ekf_post_true,cov_ekf_post_true,args.sample_size,args.batch_size)
+                density_ekf_diff, _ = density_gaussian(mu_ekf_post_diff, cov_ekf_post_diff,true_density.shape[-1],args.batch_size)
+                #kl_ekf_diff_k += kl_divergence_k(density_ekf_diff, true_density, grid_)
+
+                rmse_tot_true += rmse_ekf_true.item()
+                nll_posterior_tot_true += nll_posterior_ekf_true.item()
+                
+                nll_pred_z_tot += nll_likelihood_ekf_diff.detach().item()
+                loss_tot += loss.item()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                if epoch % 50 == 0 and i == 0:
+                    if j % 6 == 0:
+                        ax_1 = plot_ekf(mu_ekf_pred_true, cov_ekf_pred_true, mu_ekf_post_true, cov_ekf_post_true, mu_mm_true, cov_mm_true, measurements, ground_truth, folder_path, sample_batch, j, epoch,'true', None,save=False)
+          
+                        plot_ekf(mu_ekf_pred_diff.detach(), cov_ekf_pred_diff.detach(), mu_ekf_post_diff.detach(), cov_ekf_post_diff.detach(), mu_mm_likelihood.detach(), cov_mm_likelihood.detach(),  measurements, ground_truth, training_path, sample_batch, j,epoch, 'diff-ekf', ax_1)
+                        plt.close()
+
+        print(f"Epoch EKF {epoch}, Loss {loss_tot/(len(train_loader) * (args.traj_len-1))} NLL Posterior : {nll_posterior_tot / (len(train_loader) * (args.traj_len-1))}, NLL Likelihood : {nll_pred_z_tot / (len(train_loader) * (args.traj_len-1))}, True NLL {nll_posterior_tot_true / (len(train_loader) * (args.traj_len-1))}, Validation NLL: {val_loss}")
+        nll_true_list.append(nll_posterior_tot_true / (len(train_loader) * (args.traj_len-1)))
+        nll_posterior_list.append(nll_posterior_tot / (len(train_loader) * (args.traj_len-1)))
+        nll_pred_z_list.append(nll_pred_z_tot/ (len(train_loader) * (args.traj_len-1)))
+        # Plot the loss with epochs
+
+    model_save_path = os.path.join(training_path, 'measurement_model_ekf.pth')
+    torch.save(measurement_model.state_dict(), model_save_path)
+    print(f"Model saved to {model_save_path}")
+    plt.figure()
+    plt.plot(range(args.num_epochs_ekf), nll_posterior_list, label='Training Loss')
+    plt.plot(range(args.num_epochs_ekf), nll_true_list , label='True Posterior NLL')
+    plt.plot(range(args.num_epochs_ekf), loss_val_list, label='Validation Posteror NLL')
+    plt.plot(range(args.num_epochs_ekf), nll_pred_z_list, label='Train Measurement Likelihood')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training Loss vs Epochs')
+    plt.legend()
+    plt.savefig(os.path.join(training_path, 'loss_vs_epochs.png'))
+    plt.close()
+    
+
+    return measurement_model
+
+
+    
+
+def train(args,train_loader, val_loader, folder_path):
+    training_path = os.path.join(folder_path, "hef","training")
+    os.makedirs(training_path, exist_ok=True)
+    measurement_model = MeasurementModel(1,1, 20, args.band_limit)
+    # measurement_model = EnergyNetwork(1, 10, args.band_limit)
+    # likelihood_model = MeasurementModel(args.band_limit, args.band_limit, 4, args.band_limit)
+    init_weights(measurement_model)
+    # init_weights(likelihood_model)
+    optimizer = optim.Adam(measurement_model.parameters(), lr=args.learning_rate)
+    hef = HarmonicExponentialDistribution(args.band_limit, args.step_size)
+    hef_analytical = HarmonicExponentialDistribution(args.sample_size, args.step_size)
+    loss_list = []
+    nll_true_list = []
+    loss_val_list = []
+    nll_posterior_list = []
+    nll_pred_z_list = []
+    for epoch in range(args.num_epochs):
+        nll_posterior_true_tot = 0
+        nll_posterior_tot = 0
+        nll_pred_z_tot = 0
+        val_loss = validation(args, val_loader, measurement_model,epoch, folder_path)
+        loss_val_list.append(val_loss)
+        learning_rate_decay = args.learning_rate + (args.learning_rate_end - args.learning_rate) * (1 - np.exp((-args.lr_factor * epoch / args.num_epochs)))
+        print("learning_rate",learning_rate_decay)
+        for param_group in optimizer.param_groups:
+          param_group['lr'] = learning_rate_decay
+        for i, (ground_truth,measurements) in enumerate(train_loader):
+            prior = analytical_energy(ground_truth[:, 0], args.initial_cov, args.band_limit)
+            prior_true = analytical_energy(ground_truth[:, 0], args.initial_cov, args.sample_size)
+            control = torch.ones((args.batch_size, 1)) * args.step_size + torch.normal(0, args.noise_p,
+                                                                             size=(args.batch_size, 1))  # Fixed Control
+            control_true = torch.ones((args.batch_size, 1)) * args.step_size # Fixed Control
+            for j in range(1, args.traj_len):
+                # energy_true_z = analytical_energy(measurements[:, j], args.input_cov_z, args.band_limit)
+                nll_posterior,nll_likelihood ,energy_posterior,energy_pred_z, energy_bel_x_t_bar, prior = HarmonicExponentialFilter(control, measurements[:,j], ground_truth[:,j],hef, args.noise_p ** 2, args.initial_cov, prior.detach(),  args.input_cov_z, False, measurement_model)
+
+                nll_posterior_true, nll_likelihood_true, energy_posterior_true, energy_z_true, energy_bel_x_t_bar_true, prior_true = HarmonicExponentialFilter(control_true, measurements[:, j], ground_truth[:, j], hef_analytical, args.noise_p ** 2, args.initial_cov, prior_true, args.noise_z ** 2, False,None)
+
+                nll_posterior_true_tot += nll_posterior_true.item()
+
+                loss = nll_likelihood
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                nll_posterior_tot += nll_posterior.item()
+                nll_pred_z_tot += nll_likelihood.item()
+
+                if epoch % 50 == 0 and i == 0:
+                    # os.makedirs(epoch_folder_path, exist_ok=True)
+                    if j % 5 == 0:
+                        ax_1 = plot_distributions(energy_posterior_true, energy_z_true, energy_bel_x_t_bar_true, ground_truth,
+                                measurements, 0, j, 0, "true", folder_path,None,False)
+                        plot_distributions(energy_posterior, energy_pred_z, energy_bel_x_t_bar, ground_truth,
+                                           measurements, 0, j, epoch, "training_hef", training_path,ax_1)
+        print(f"Epoch HEF {epoch} Training Posterior: {nll_posterior_tot / (len(train_loader)* (args.traj_len-1))} Training Measurement Likelihood: {nll_pred_z_tot/(len(train_loader)* (args.traj_len-1))} True NLL: {nll_posterior_true_tot / (len(train_loader)* (args.traj_len-1))}, Validation NLL: {val_loss}")
+        # Append the loss to a list
+        nll_true_list.append(nll_posterior_true_tot / (len(train_loader) * args.traj_len))
+        nll_posterior_list.append(nll_posterior_tot / (len(train_loader) * args.traj_len))
+        nll_pred_z_list.append(nll_pred_z_tot / (len(train_loader) * args.traj_len))
+        # Plot the loss with epochs
+
+    plt.figure()
+    plt.plot(range(args.num_epochs), nll_posterior_list , label='Training Posterior')
+    plt.plot(range(args.num_epochs), nll_true_list , label='True Posterior NLL')
+    plt.plot(range(args.num_epochs), loss_val_list, label='Validation Posteror NLL')
+    plt.plot(range(args.num_epochs), nll_pred_z_list, label='Train Measurement Likelihood')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training Loss vs Epochs')
+    plt.legend()
+    plt.savefig(os.path.join(training_path, 'loss_vs_epochs.png'))
+    # plt.show()
+    model_save_path = os.path.join(training_path, 'obs_model.pth')
+    torch.save(measurement_model.state_dict(), model_save_path)
+    print(f"Model saved to {model_save_path}")
+    # likelihood_model_save_path = os.path.join(training_path, 'likelihood_model.pth')
+    # torch.save(likelihood_model.state_dict(), likelihood_model_save_path)
+    # print(f"Model saved to {likelihood_model_save_path}")
+
+
+    return measurement_model
+
+def safe_i0(kappa, log_i0=False):
+      """
+      Compute the modified Bessel function of the first kind, I_0(kappa),
+      with a safe approach for large kappa values.
+      """
+      if torch.max(kappa) > 40:  # Handle large values
+          if log_i0:
+            i_0 = kappa - torch.log(2 * math.pi * kappa) / 2
+          else:
+            i_0 = torch.exp(kappa - torch.log(2 * math.pi * kappa) / 2)  
+      else:
+          if log_i0:
+            i_0 = torch.log(torch.special.i0(kappa))
+          else:
+            i_0 = torch.special.i0(kappa)
+      return i_0
+
+def neg_log_likelihood(mean,cov,value):
+    diff = absolute_error_s1(mean, value)
+    nll = 0.5 * torch.log(2 * torch.pi * cov) + 0.5 * (diff ** 2)/ cov
+    return torch.mean(nll)
+
+def neg_log_likelihood_vmf(mean,cov,value):
+    kappa = 1/cov 
+    #  nll = - kappa * np.cos(value - self.mean) + np.log(2*math.pi*i0(kappa))
+    nll = - kappa * torch.cos(mean - value) + torch.log(torch.tensor(2 * math.pi)) + safe_i0(kappa, log_i0=True)
+    return torch.mean(nll)
+
+# def neg_log_likelihood_batch(mean,cov,value):
+#     diff = absolute_error_s1(mean, value)
+#     nll = 0.5 * torch.log(2 * torch.pi * cov) + 0.5 * (diff ** 2)/ cov
+#     return torch.mean(nll)
+
+def EKF(ekf_temp, measurements, ground_truth, measurement_cov, noisy_mean=False, measurement_model=None):
+    batch_size = measurements.size(0)
+    ekf_temp.predict()
+    mu_ekf_pred, cov_ekf_pred = ekf_temp.x, ekf_temp.P
+    if noisy_mean:
+        noisy_measurements = (measurements + torch.normal(0, np.sqrt(measurement_cov), size=(batch_size, 1))) %(2 * math.pi)
+    else:
+        noisy_measurements = measurements
+    # if (mu_ekf_pred - noisy_measurements).abs().mean() > 0.6:
+    #     pdb.set_trace()
+    # mu_ekf_pred = mu_ekf_pred.detach()
+    if measurement_model is not None:
+        mu,logcov = measurement_model(mu_ekf_pred)
+        # mu = noisy_measurements
+        cov = torch.exp(logcov)
+        ekf_temp.update(mu,cov)
+    else:
+        mu = noisy_measurements
+        cov = torch.tile(torch.tensor(measurement_cov), (batch_size, 1))
+        ekf_temp.update(mu, cov)
+    mu_ekf_post, cov_ekf_post = ekf_temp.x, ekf_temp.P
+    # vmf = VonMissesDistribution_torch(mu_ekf_post, cov_ekf_post,None)
+    nll_posterior_ekf = neg_log_likelihood_vmf(mu_ekf_post, cov_ekf_post, ground_truth)
+    nll_mm_likelihood_ekf = neg_log_likelihood_vmf(mu,cov,measurements)
+    rmse_ekf = root_mean_square_error_s1(mu_ekf_post, ground_truth)
+    return rmse_ekf, nll_posterior_ekf, nll_mm_likelihood_ekf, mu_ekf_post, cov_ekf_post,mu_ekf_pred, cov_ekf_pred, mu, cov
+
+def HarmonicExponentialFilter(control, measurements, ground_truth,hef, process_cov, input_cov, prior, measurement_cov, noisy_mean=False, measurement_model=None):
+    # grid = torch.linspace(0, 2*math.pi, args.band_limit+1)[:-1]
+
+    batch_size = measurements.size(0)
+    energy_process = analytical_energy(control, process_cov, hef.band_limit)
+    eta_bel_x_t_bar, energy_bel_x_t_bar = hef.predict(prior, energy_process)
+
+    mean_bel_x_t_bar = hef.mode(energy_bel_x_t_bar)
+    if noisy_mean:
+        input_measurement = measurements + torch.normal(0, np.sqrt(measurement_cov), size=(batch_size, 1))
+    else:
+        input_measurement = measurements
+    
+    if measurement_model is not None:
+        input_measurement_energy = analytical_energy(input_measurement,0.03, hef.band_limit)
+        # energy_pred_z = measurement_model(energy_bel_x_t_bar,input_measurement_energy)
+        energy_pred_z = measurement_model(mean_bel_x_t_bar, measurements)
+        # predicted_measurement = measurement_model(mean_bel_x_t_bar)
+        # energy_pred_z = likelihood_model(input_measurement,predicted_measurement)
+    # elif measurement_cov is not None:
+    #     energy_pred_z = analytical_energy(input_measurement, measurement_cov, hef.band_limit)
+    # else:
+    #     raise ValueError("Either provide a measurement model or measurement covariance")
+    else:
+        energy_pred_z = analytical_energy(input_measurement, measurement_cov, hef.band_limit)
+
+    energy_posterior = hef.update(eta_bel_x_t_bar, energy_pred_z)
+    prior = energy_posterior
+    nll_posterior = loss_fn(energy_posterior, ground_truth, hef.band_limit)
+    nll_likelihood = loss_fn(energy_pred_z, measurements, hef.band_limit)
+    # nll_posterior_check = torch.mean(-interp1d(grid,energy_posterior,ground_truth[:, j]) + hef.normalisation_constant(energy_posterior))
+    return nll_posterior, nll_likelihood, energy_posterior,energy_pred_z, energy_bel_x_t_bar, prior
+
+def nll_lstm(predicted_label, predicted_covariance, true_label):
+    """
+    Args:
+        predicted_label (torch.Tensor): Predicted labels.
+        true_label (torch.Tensor): True labels.
+
+    Returns:
+        loss (torch.Tensor): Loss value.
+    """
+    # print(predicted_label.shape)
+    diff = absolute_error_s1(predicted_label,true_label)
+    nll = 0.5 * (diff ** 2 / predicted_covariance) + 0.5 * torch.log(2* math.pi* predicted_covariance)
+    return torch.mean(nll)
+
+def density_gaussian(mu,cov,num_samples,batch_size):
+    grid = torch.linspace(0, 2*math.pi, num_samples+1)[:-1][None,:].repeat(batch_size,1)
+    diff = absolute_error_s1(grid,mu)
+    density = torch.exp(-0.5 * (diff ** 2) / cov) / torch.sqrt(2 * math.pi * cov)
+    return density, grid
+
+def density_gaussian_lstm(mu,cov,num_samples,batch_size,traj_len):
+    grid = torch.linspace(0, 2*math.pi, num_samples+1)[:-1][None,None,:].repeat(batch_size,traj_len,1)
+    diff = absolute_error_s1(grid,mu)
+    print("gaussian lstm", diff.shape)
+    density = torch.exp(-0.5 * (diff ** 2) / cov) / torch.sqrt(2 * math.pi * cov)
+    return density, grid
+
+
+def main(args, folder_path, test_loader,measurement_model_temp=None, measurement_model_ekf=None):
+    if measurement_model_temp is None and args.model_path is not None:
+            # measurement_model_temp = EnergyNetwork(1, 10, args.band_limit)
+            measurement_model_temp = MeasurementModel(1,1, 20, args.band_limit)
+            init_weights(measurement_model_temp)
+            print('Loading pre-trained model')
+            measurement_model_temp.load_state_dict(torch.load(args.model_path))
+    else:
+        measurement_model_temp = MeasurementModel(1,1, 20, args.band_limit)
+        init_weights(measurement_model_temp)
+
+    if measurement_model_ekf is None and args.model_path_gp_mm is not None:
+        measurement_model_ekf = SimpleModel()
+        measurement_model_ekf.load_state_dict(torch.load(args.model_path_gp_mm))
+    else:
+        measurement_model_ekf = SimpleModel()
+        measurement_model_ekf.apply(init_weights)
+
+
+    if args.model_path_lstm is not None:
+        lstm = LSTMFilter()
+        lstm.load_state_dict(torch.load(args.model_path_lstm))
+    else:
+        lstm = LSTMFilter()
+        lstm.apply(init_weights)
+
+        
+    hef = HarmonicExponentialDistribution(args.band_limit, args.step_size)
+    hef_analytical = HarmonicExponentialDistribution(args.sample_size, args.step_size)
 
     nll_posterior_tot = 0
     rmse_tot = 0
     ground_truth, measurements = next(iter(test_loader))
-
-    prior = analytical_energy(ground_truth[:, 0], args.initial_cov, args.band_limit)
-    prior_hef = analytical_energy(ground_truth[:, 0], args.initial_cov, args.band_limit)
-    prior_true = analytical_energy(ground_truth[:, 0], args.initial_cov, args.band_limit)
-    control = torch.ones((args.batch_size, 1)) * args.step_size + torch.normal(0, args.noise_p, size=(args.batch_size, 1))  # Fixed Control
+    ground_truth = ground_truth[0:args.batch_size]
+    measurements = measurements[0:args.batch_size]
     
+    prior = analytical_energy(ground_truth[:, 0], args.initial_cov, args.band_limit)
+    prior_hef = analytical_energy(ground_truth[:, 0], args.initial_cov, args.sample_size)
+    prior_true = analytical_energy(ground_truth[:, 0], args.initial_cov, args.sample_size)
+
+    control = torch.ones((args.batch_size, 1)) * args.step_size + torch.normal(0, args.noise_p, size=(args.batch_size, 1))  # Fixed Control
+    control_true = torch.ones((args.batch_size, 1)) * args.step_size # Fixed Control
+    
+    initial_cov_batch = torch.ones((args.batch_size, 1)) * args.initial_cov
+    process_cov_batch = torch.ones((args.batch_size, 1)) * (args.noise_p ** 2)
+    # noisy_initial_state = ground_truth[:, 0] + torch.normal(0, np.sqrt(args.initial_cov), size=(args.batch_size, 1))
+    ekf = ExtendedKalmanFilter(initial_cov_batch , process_cov_batch)
+    ekf.set_initial_state(ground_truth[:, 0])
+    ekf.set_step(control)
+    ekf_diff = ExtendedKalmanFilter(initial_cov_batch, process_cov_batch)
+    ekf_diff.set_initial_state(ground_truth[:, 0])
+    ekf_diff.set_step(control)
+    ekf_true = ExtendedKalmanFilter(initial_cov_batch, process_cov_batch)
+    ekf_true.set_initial_state(ground_truth[:, 0])
+    ekf_true.set_step(control_true)
+
     nll_posterior_tot = 0
     rmse_tot = 0
+    nll_likelihood_tot = 0
     nll_posterior_tot_hef = 0
     rmse_tot_hef = 0
+    nll_likelihood_tot_hef = 0
+
+    nll_likelihood_ekf_tot = 0
+    nll_likelihood_ekf_diff_tot = 0
+    nll_likelihood_ekf_true_tot = 0
+
     nll_posterior_tot_true = 0
     rmse_tot_true = 0
-    nll_posterior_check_tot = 0
-    nll_posterior_true_check_tot = 0
-    nll_posterior_hef_check_tot = 0
-    for j in range(args.traj_len):
-        grid = torch.linspace(0, 2*math.pi, args.band_limit+1)[:-1]
-        # pdb.set_trace()
-        # Inference over differentiable HEF
-        energy_process = analytical_energy(control, args.noise_p ** 2, args.band_limit)
-        # Predict Step
-        eta_bel_x_t_bar, energy_bel_x_t_bar = hef.predict(prior, energy_process)
-        # mean_bel_x_t_bar = hef.mode(energy_bel_x_t_bar)
-        # P(z_t | x_t) Measurement Step
-        # energy_pred_z = measurement_model(energy_true_z, energy_bel_x_t_bar)
-        # noisy_measurement = measurements[:, j] + torch.normal(0, np.sqrt(args.input_cov_z), size=(args.batch_size, 1))
-        energy_pred_z = measurement_model(measurements[:, j])
-        # energy_pred_z = measurement_model(ground_truth[:, j])
-        energy_posterior = hef.update(eta_bel_x_t_bar, energy_pred_z)
-        # Current posterior is prior for the next step (j + 1)
-        prior = energy_posterior
-        nll_posterior = loss_fn(energy_posterior, ground_truth[:, j], args.band_limit)
-        nll_posterior_check = torch.mean(-interp1d(grid,energy_posterior,ground_truth[:, j]) + hef.normalisation_constant(energy_posterior))
-  
+    nll_likelihood_tot_true = 0
 
+
+    nll_posterior_ekf_tot = 0
+    rmse_ekf_tot = 0
+    rmse_ekf_diff_tot = 0
+    nll_posterior_ekf_diff_tot = 0
+
+    rmse_ekf_true_tot = 0
+    nll_posterior_ekf_true_tot = 0
+    rmse_true_mode_tot = 0
+
+    kl_ekf = 0
+    kl_ekf_diff = 0
+    kl_ekf_k = 0
+    kl_ekf_diff_k = 0
+    kl_divergence_hef_k = 0
+    kl_divergence_hef_diff_k = 0
+
+    true_density_list = []
+    # sample_batch =  np.random.choice(args.batch_size,1).item()
+    sample_batch = 0
+    for j in range(1,args.traj_len):
+        
+        # Diff HEF 
+        nll_posterior, nll_likelihood, energy_posterior,energy_pred_z, energy_bel_x_t_bar, prior = HarmonicExponentialFilter(control, measurements[:, j], ground_truth[:, j], hef, args.noise_p ** 2, args.initial_cov, prior,  args.input_cov_z, False,measurement_model_temp)
 
         # Analytical HEF
-        energy_z_hef = analytical_energy(measurements[:, j], args.input_cov_z, args.band_limit)
-        eta_bel_x_t_bar_hef, energy_bel_x_t_bar_hef = hef.predict(prior_hef, energy_process)
-        energy_posterior_hef = hef.update(eta_bel_x_t_bar_hef, energy_z_hef)
-        prior_hef = energy_posterior_hef
-        nll_posterior_hef = loss_fn(energy_posterior_hef, ground_truth[:, j], args.band_limit)
-        nll_posterior_hef_check = torch.mean(-interp1d(grid,energy_posterior_hef,ground_truth[:, j]) + hef.normalisation_constant(energy_posterior_hef))
+        nll_posterior_hef, nll_likelihood_hef, energy_posterior_hef,energy_z_hef, energy_bel_x_t_bar_hef, prior_hef = HarmonicExponentialFilter(control, measurements[:, j], ground_truth[:, j], hef_analytical, args.noise_p ** 2, args.initial_cov, prior_hef,args.input_cov_z, False,None)
 
-        # True Posterior 
-        energy_z_true = analytical_energy(measurements[:, j], args.noise_z **2 , args.band_limit)
-        eta_bel_x_t_bar_true, energy_bel_x_t_bar_true = hef.predict(prior_true, energy_process)
-        energy_posterior_true = hef.update(eta_bel_x_t_bar_true, energy_z_true)
-        prior_true = energy_posterior_true
-        nll_posterior_true = loss_fn(energy_posterior_true, ground_truth[:, j], args.band_limit)
-     
-        nll_posterior_true_check = torch.mean(-interp1d(grid,energy_posterior_true,ground_truth[:, j]) + hef.normalisation_constant(energy_posterior_true))
-        # Gaussian Posterior EKF 
+        # True Posterior
+        nll_posterior_true, nll_likelihood_true, energy_posterior_true,energy_z_true, energy_bel_x_t_bar_true, prior_true = HarmonicExponentialFilter(control_true, measurements[:, j], ground_truth[:, j], hef_analytical, args.noise_p ** 2, args.initial_cov, prior_true, args.noise_z ** 2, False,None)
 
-        # Pretrained LSTM Model
+        true_density = hef_analytical.convert_energy_density(energy_posterior_true)
+        # EKF 
+        rmse_ekf, nll_posterior_ekf, nll_likelihood_ekf, mu_ekf_post, cov_ekf_post,mu_ekf_pred, cov_ekf_pred, mu_measurement_ekf, cov_measurement_ekf = EKF(ekf, measurements[:, j], ground_truth[:, j], args.input_cov_z, False, None)
 
-
+        rmse_ekf_diff, nll_posterior_ekf_diff, nll_likelihood_ekf_diff, mu_ekf_post_diff, cov_ekf_post_diff ,mu_ekf_pred_diff, cov_ekf_pred_diff, mu_measurement_ekf_diff, cov_measurement_ekf_diff = EKF(ekf_diff, measurements[:, j], ground_truth[:, j], args.input_cov_z, False,  measurement_model_ekf)
+        
+        rmse_ekf_true, nll_posterior_ekf_true, nll_likelihood_ekf_true, mu_ekf_post_true, cov_ekf_post_true ,mu_ekf_pred_true, cov_ekf_pred_true, mu_measurement_ekf_true, cov_measurement_ekf_true = EKF(ekf_true, measurements[:, j], ground_truth[:, j], args.noise_z **2 , False, None)
+        
         # Metrics
-        nll_posterior_iter = nll_posterior.item()
-        nll_posterior_tot += nll_posterior_iter
+        nll_likelihood_tot_hef += nll_likelihood_hef.item()
+        nll_likelihood_tot += nll_likelihood.item()
+        nll_likelihood_tot_true += nll_likelihood_true.item()
 
-        nll_posterior_check_tot += nll_posterior_check.item()
+        nll_posterior_ekf_tot += nll_posterior_ekf.item()
+        nll_posterior_ekf_diff_tot += nll_posterior_ekf_diff.item()
+        rmse_ekf_tot += rmse_ekf.item()
+        rmse_ekf_diff_tot += rmse_ekf_diff.item()
+        density_ekf, grid_ = density_gaussian(mu_ekf_post, cov_ekf_post,true_density.shape[-1],args.batch_size)
+        density_ekf_diff, _ = density_gaussian(mu_ekf_post_diff, cov_ekf_post_diff,true_density.shape[-1],args.batch_size)
+        # kl_ekf += kl_divergence_s1(density_ekf, true_density)
+        # kl_ekf_diff += kl_divergence_s1(density_ekf_diff, true_density)
+        kl_ekf_k += kl_divergence_k(density_ekf, true_density, grid_)
+        kl_ekf_diff_k += kl_divergence_k(density_ekf_diff, true_density, grid_)
 
-        mean_posterior = hef.mean(energy_posterior)
-        rmse = torch.sqrt(torch.mean((ground_truth[:, j] - mean_posterior) ** 2))
-        rmse_tot += rmse
+        nll_likelihood_ekf_tot += nll_likelihood_ekf.item()
+        nll_likelihood_ekf_diff_tot += nll_likelihood_ekf_diff.item()
+        nll_likelihood_ekf_true_tot += nll_likelihood_ekf_true.item()
 
-        nll_posterior_iter_hef = nll_posterior_hef.item()
-        nll_posterior_tot_hef += nll_posterior_iter_hef
+        nll_posterior_tot += nll_posterior.item()
+        mean_posterior = hef.mode(energy_posterior)
+        rmse = root_mean_square_error_s1(mean_posterior, ground_truth[:, j])
+        rmse_tot += rmse.item()
+        nll_posterior_tot_hef += nll_posterior_hef.item()
+        mean_posterior_hef = hef_analytical.mode(energy_posterior_hef)
+        rmse_hef = root_mean_square_error_s1(mean_posterior_hef, ground_truth[:, j])
+        rmse_tot_hef += rmse_hef.item()
+        density_hef = hef_analytical.convert_energy_density(energy_posterior_hef)
+        kl_divergence_hef_k += kl_divergence_k(density_hef, true_density, grid_)
 
-        nll_posterior_hef_check_tot += nll_posterior_hef_check.item()
+        density_hef_diff = hef_analytical.convert_energy_density(energy_posterior)
+        grid_ds = torch.linspace(0, 2*math.pi, args.band_limit+1)[:-1][None,:].repeat(args.batch_size,1)
+        true_density_ds = interp1d(grid_,true_density,grid_ds)
+        kl_divergence_hef_diff_k += kl_divergence_k(density_hef_diff, true_density_ds, grid_ds)
 
-        mean_posterior_hef = hef.mean(energy_posterior_hef)
-        rmse_hef = torch.sqrt(torch.mean((ground_truth[:, j] - mean_posterior_hef) ** 2))
-        rmse_tot_hef += rmse_hef
                                    
-        nll_posterior_iter_true = nll_posterior_true.item()
-        nll_posterior_tot_true += nll_posterior_iter_true
+        nll_posterior_tot_true += nll_posterior_true.item()
+        mean_posterior_true = hef_analytical.mode(energy_posterior_true)
+        rmse_true = root_mean_square_error_s1(mean_posterior_true, ground_truth[:, j])
+        rmse_tot_true += rmse_true.item()
 
-        nll_posterior_true_check_tot = nll_posterior_true_check.item()
-        mean_posterior_true = hef.mean(energy_posterior_true)
-        rmse_true = torch.sqrt(torch.mean((ground_truth[:, j] - mean_posterior_true) ** 2))
-        rmse_tot_true += rmse_true
+        rmse_ekf_true_tot += rmse_ekf_true.item()
+        nll_posterior_ekf_true_tot += nll_posterior_ekf_true.item()
 
-        print(f"Iteration {j} Diff HEF NLL Posterior: {nll_posterior_iter}  RMSE: {rmse}")
-        print(f"Iteration {j} Analytical HEF NLL Posterior: {nll_posterior_iter_hef}  RMSE: {rmse_hef}")
-        print(f"Iteration {j} True Posterior NLL Posterior: {nll_posterior_iter_true}  RMSE: {rmse_true}")
-        print(f"Interpolator Check: DiffHEF {nll_posterior_check.item()} HEF {nll_posterior_hef_check} True Posterior {nll_posterior_true_check.item()}")
-        wandb.log({"Iteration": j, "NLL Posterior Diff HEF": nll_posterior_iter, "RMSE Diff HEF": rmse
-                    , "NLL Posterior Analytical HEF": nll_posterior_iter_hef, "RMSE Analytical HEF": rmse_hef
-                    , "NLL Posterior True Posterior": nll_posterior_iter_true, "RMSE True Posterior": rmse_true})
+        true_density_list.append(true_density)
+
+        print(f"Iteration {j} Diff HEF NLL Posterior: {nll_posterior.item()}  RMSE: {rmse}")
+        print(f"Iteration {j} Analytical HEF NLL Posterior: {nll_posterior_hef.item()}  RMSE: {rmse_hef}")
+        print(f"Iteration {j} True Posterior NLL Posterior: {nll_posterior_true.item()}  RMSE: {rmse_true}")
+        print(f"Iteration {j} EKF NLL Posterior: {nll_posterior_ekf.item()}, RMSE: {rmse_ekf}")
+        print(f"Iteration {j} Diff-EKF NLL Posterior: {nll_posterior_ekf_diff}, RMSE: {rmse_ekf_diff}")
+        print(f"Iteration {j} True EKF NLL Posterior: {nll_posterior_ekf_true.item()}, RMSE: {rmse_ekf_true}")
+        # wandb.log({"Iteration": j, "NLL Posterior Diff HEF": nll_posterior.item(), "RMSE Diff HEF": rmse
+        #             , "NLL Posterior Analytical HEF": nll_posterior_hef.item(), "RMSE Analytical HEF": rmse_hef
+        #             , "NLL Posterior True Posterior": nll_posterior_true.item(), "RMSE True Posterior": rmse_true,
+        #             'NLL Posterior EKF': nll_posterior_ekf.item(), 'RMSE EKF': rmse_ekf,
+        #             'NLL Posterior Diff EKF': nll_posterior_ekf_diff, 'RMSE Diff EKF': rmse_ekf_diff})
         if j % 6 == 0:
-            # fig, ax = plt.subplots()
-            # ax.plot(torch.cos(mean_bel_x_t_bar[0, 0]), torch.sin(mean_bel_x_t_bar[0, 0]), 'o', label="mean pred z")
+            ax_1 = plot_distributions(energy_posterior_true, energy_z_true, energy_bel_x_t_bar_true, ground_truth,
+                                measurements, sample_batch, j, 0, "true", folder_path,None,False)
+            # ax_1 = plot_ekf(mu_ekf_pred_true, cov_ekf_pred_true, mu_ekf_post_true, cov_ekf_post_true, measurements, ground_truth, folder_path, sample_batch, j,'true', None,save=False)
+          
             plot_distributions(energy_posterior, energy_pred_z, energy_bel_x_t_bar, ground_truth,
-                                measurements, 0, j, 0, "diff_hef", folder_path)
+                                measurements, sample_batch, j, 0, "diff_hef", folder_path,ax_1)
             plot_distributions(energy_posterior_hef, energy_z_hef, energy_bel_x_t_bar_hef, ground_truth,
-                                measurements, 0, j, 0, "hef", folder_path)
-            plot_distributions(energy_posterior_true, energy_z_true, energy_bel_x_t_bar_true, ground_truth,
-                                measurements, 0, j, 0, "true", folder_path)
-            
-                
-    average_nll_traj = nll_posterior_tot/args.traj_len
-    average_rmse = rmse_tot/args.traj_len
+                                measurements, sample_batch, j, 0, "hef", folder_path,ax_1)
+            plot_ekf(mu_ekf_pred, cov_ekf_pred, mu_ekf_post, cov_ekf_post, mu_measurement_ekf, cov_measurement_ekf ,measurements, ground_truth, folder_path, sample_batch, j,0, 'ekf', ax_1)
+            plot_ekf(mu_ekf_pred_diff.detach(), cov_ekf_pred_diff.detach(), mu_ekf_post_diff.detach(), cov_ekf_post_diff.detach(), mu_measurement_ekf_diff.detach(), cov_measurement_ekf_diff.detach(), measurements, ground_truth, folder_path, sample_batch, j,0, 'diff-ekf', ax_1)
+            plot_ekf(mu_ekf_pred_true, cov_ekf_pred_true, mu_ekf_post_true, cov_ekf_post_true, mu_measurement_ekf_true, cov_measurement_ekf_true, measurements, ground_truth, folder_path, sample_batch, j, 0, 'true-ekf', ax_1)
+            plt.close()
 
-    average_nll_traj_hef = nll_posterior_tot_hef/args.traj_len
-    average_rmse_hef = rmse_tot_hef/args.traj_len
+    control_lstm = torch.ones((args.batch_size, 1,1)) * args.step_size + torch.normal(0, args.noise_p, size=(args.batch_size, args.traj_len, 1))  # Fixed Control       
+    # measurements_noisy = measurements + torch.normal(0, np.sqrt(args.input_cov_z), size=(args.batch_size, args.traj_len, 1))
+    initial_state = torch.ones((args.batch_size, 1)) * ground_truth[:, 0] + torch.normal(0, args.initial_cov, size=(args.batch_size, 1))
+    print(measurements.shape)
+    print(control_lstm.shape)
+    mu_lstm, logcov_lstm = lstm(control_lstm, measurements, initial_state)
+    mu_lstm = mu_lstm % (2 * math.pi)
+    cov_lstm = torch.exp(logcov_lstm)
+    nll_lstm_ = nll_lstm(mu_lstm, cov_lstm, ground_truth)
+    rmse_lstm = root_mean_square_error_s1(mu_lstm, ground_truth)
+    true_density_lstm = torch.stack(true_density_list, dim=1)
+    print("true denisty lstm", true_density_lstm.shape)
+    lstm_density, grid_lstm = density_gaussian_lstm(mu_lstm[:,1:],cov_lstm[:,1:],true_density_lstm.shape[-1],args.batch_size,args.traj_len-1)
+    kl_divergence_lstm_k = kl_divergence_k(lstm_density, true_density_lstm, grid_lstm)
+    
+    average_nll_traj = nll_posterior_tot/(args.traj_len-1)
+    average_rmse = rmse_tot/(args.traj_len-1)
 
-    average_nll_traj_true = nll_posterior_tot_true/args.traj_len
-    average_rmse_true = rmse_tot_true/args.traj_len
+    average_nll_traj_hef = nll_posterior_tot_hef/(args.traj_len-1)
+    average_rmse_hef = rmse_tot_hef/(args.traj_len-1)
 
-    average_nll_traj_check = nll_posterior_check_tot/args.traj_len
-    average_nll_traj_hef_check = nll_posterior_hef_check_tot/args.traj_len
-    average_nll_traj_true_check = nll_posterior_true_check_tot/args.traj_len
+    average_nll_traj_true = nll_posterior_tot_true/(args.traj_len-1)
+    average_rmse_true = rmse_tot_true/(args.traj_len-1)
 
-    print(f"Avg NLL Posterior Diff HEF: {average_nll_traj} Average RMSE: {average_rmse}")
-    print(f"Avg NLL Posterior Analytical HEF: {average_nll_traj_hef}  Average RMSE: {average_rmse_hef}")
-    print(f"Avg NLL Posterior True Posterior: {average_nll_traj_true} Average RMSE: {average_rmse_true}")
-    print(f"Avg Interpolator: DiffHEF {average_nll_traj_check} HEF {average_nll_traj_hef_check} True {average_nll_traj_true_check}")
+    average_nll_likelihood_hef = nll_likelihood_tot_hef/(args.traj_len-1)
+    average_nll_likelihood = nll_likelihood_tot/(args.traj_len-1)
+    average_nll_likelihood_true = nll_likelihood_tot_true/(args.traj_len-1)
 
-    wandb.log({"Average NLL Posterior Diff HEF": average_nll_traj, "Average RMSE Diff HEF": average_rmse, 
-               "Average NLL Posterior Analytical HEF": average_nll_traj_hef, "Average RMSE Analytical HEF": average_rmse_hef,
-               "Average NLL Posterior True Posterior": average_nll_traj_true, "Average RMSE True Posterior": average_rmse_true})
+    average_nll_traj_ekf = nll_posterior_ekf_tot/(args.traj_len-1)
+    average_rmse_ekf = rmse_ekf_tot/(args.traj_len-1)
+
+    average_nll_traj_ekf_diff = nll_posterior_ekf_diff_tot/(args.traj_len-1)
+    average_rmse_ekf_diff = rmse_ekf_diff_tot/(args.traj_len-1)
+
+    average_rmse_ekf_true = rmse_ekf_true_tot/(args.traj_len-1)
+    average_nll_traj_ekf_true = nll_posterior_ekf_true_tot/(args.traj_len-1)
+
+    average_nll_likelihood_ekf = nll_likelihood_ekf_tot/(args.traj_len-1)
+    average_nll_likelihood_ekf_diff = nll_likelihood_ekf_diff_tot/(args.traj_len-1)
+    average_nll_likelihood_ekf_true = nll_likelihood_ekf_true_tot/(args.traj_len-1)
+
+    
+
+
+    print(f"Diff HEF :: Avg NLL Posterior: {average_nll_traj} Avg RMSE: {average_rmse} KL Divergence: {kl_divergence_hef_k/(args.traj_len -1 )} Avg NLL Measurement: {average_nll_likelihood}")
+    print(f"HEF :: Avg NLL Posterior: {average_nll_traj_hef}  Avg RMSE: {average_rmse_hef} KL Divergence: {kl_divergence_hef_k/(args.traj_len-1)} Avg NLL Measurement: {average_nll_likelihood_hef}")
+    print(f"EKF :: Avg NLL Posterior: {average_nll_traj_ekf} Avg RMSE: {average_rmse_ekf} KL Divergence: {kl_ekf_k/(args.traj_len-1)} Avg NLL Measurement: {average_nll_likelihood_ekf}")
+    print(f"Diff EKF :: Avg NLL Posterior: {average_nll_traj_ekf_diff} Avg RMSE: {average_rmse_ekf_diff} KL Divergence: {kl_ekf_diff_k/(args.traj_len-1)}  Avg NLL Measurement: {average_nll_likelihood_ekf_diff}")
+    print(f"LSTM :: Avg NLL Posterior: {nll_lstm_} Avg RMSE: {rmse_lstm} KL Divergence: {kl_divergence_lstm_k}")
+    print(f"HEF True :: Avg NLL Posterior: {average_nll_traj_true} Avg RMSE: {average_rmse_true} Avg NLL Measurement : {average_nll_likelihood_true}")
+    print(f"EKF True :: Avg NLL Posterior {average_nll_traj_ekf_true} Avg RMSE: {average_rmse_ekf_true} Avg NLL Measurement : {average_nll_likelihood_ekf_true}")
+
+    
+    table = wandb.Table(columns=["Model", "RMSE", "NLL","KL Divergence"])
+    table.add_data("Diff HEF", average_rmse, average_nll_traj, (kl_divergence_hef_diff_k/args.traj_len).item())
+    table.add_data("Analytical HEF", average_rmse_hef, average_nll_traj_hef, (kl_divergence_hef_k/args.traj_len).item())
+    table.add_data("EKF", average_rmse_ekf, average_nll_traj_ekf, (kl_ekf_k/args.traj_len).item())
+    table.add_data("Diff EKF", average_rmse_ekf_diff, average_nll_traj_ekf_diff, (kl_ekf_diff_k/args.traj_len).item())
+    table.add_data("LSTM", rmse_lstm.item(), nll_lstm_.item(), (kl_divergence_lstm_k).item())
+    table.add_data("True Posterior", average_rmse_true, average_nll_traj_true, 0)
+    wandb.log({"Summary": table})
+
     if os.path.exists(folder_path):
         print(f"Generating gif for diff hef")
         video_path = f"{folder_path}/diff_hef.gif"
@@ -487,11 +967,36 @@ def main(args):
         wandb.log({rf"diff_hef": wandb.Video(video_path, format="gif", )})
 
 
+def plot_ekf(mu_pred, cov_pred, mu_post, cov_post, mu_meas, cov_meas, measurements, ground_truth, folder_path, batch_idx, traj_iter, epoch, title, ax_1,save=True):
+    # if ax is None:
+    fig, ax = plt.subplots()
+    if ax_1 is not None:
+        ax_state = pickle.dumps(ax_1)
+        ax = pickle.loads(ax_state)
+    if cov_pred.shape != torch.Size([]) and cov_post.shape != torch.Size([]):
+        cov_pred = cov_pred[batch_idx,0]
+        cov_post = cov_post[batch_idx,0]
 
-def plot_distributions(energy_posterior, energy_pred_z, energy_bel_x_t_bar, ground_truth, measurements, i, j, epoch, title, folder_path, ax=None):
-    print(f"Plotting Epoch {epoch} Traj{i} Iteration {j}")
-    if ax is None:
-        fig, ax = plt.subplots()
+    plotting_von_mises(mu_pred[batch_idx,0].numpy(), cov_pred.item(), args.sample_size, ax, "predict")
+    plotting_von_mises(mu_post[batch_idx,0].numpy(), cov_post.item(), args.sample_size, ax, "posterior")
+    plotting_von_mises(mu_meas[batch_idx,0].numpy(), cov_meas[batch_idx,0].item(), args.sample_size, ax, "measurement")
+    ax.plot(torch.cos(measurements[batch_idx, traj_iter]), torch.sin(measurements[batch_idx, traj_iter]), 'o', label="measurement")
+    ax.plot(torch.cos(ground_truth[batch_idx, traj_iter]), torch.sin(ground_truth[batch_idx, traj_iter]), 'o', label="pose")
+    ax.set_title(f"Iteration {traj_iter}", loc='center')
+    ax.legend(bbox_to_anchor=(0.85, 1), loc='upper left', fontsize='x-small')
+    if save:
+         plt.savefig(f"{folder_path}/{title}_epoch_{epoch}_iter_{traj_iter}.png", format='png', dpi=300)
+    return ax
+
+    
+
+def plot_distributions(energy_posterior, energy_pred_z, energy_bel_x_t_bar, ground_truth, measurements, i, j, epoch, title, folder_path, ax_1=None, save=True):
+    # print(f"Plotting Epoch {epoch} Traj{i} Iteration {j}")
+    # if ax_1 is None:
+    fig, ax = plt.subplots()
+    if ax_1 is not None:
+        ax_state = pickle.dumps(ax_1)
+        ax = pickle.loads(ax_state)
     energy_posterior = energy_posterior[i].detach()
     energy_pred_z = energy_pred_z[i].detach()
     energy_bel_x_t_bar = energy_bel_x_t_bar[i].detach()
@@ -502,8 +1007,9 @@ def plot_distributions(energy_posterior, energy_pred_z, energy_bel_x_t_bar, grou
     ax.plot(torch.cos(ground_truth[i, j]), torch.sin(ground_truth[i, j]), 'o', label="pose data")
     ax.set_title(f"Epoch {epoch} Traj{i} Iteration {j}", loc='center')
     ax.legend(bbox_to_anchor=(0.85, 1), loc='upper left', fontsize='x-small')
-    plt.savefig(f"{folder_path}/{title}_iter_{j}.png", format='png', dpi=300)
-    plt.close()
+    if save:
+        plt.savefig(f"{folder_path}/{title}_{epoch}_iter_{j}.png", format='png', dpi=300)
+        # plt.cla()
     return ax
 
 
@@ -512,37 +1018,59 @@ import argparse
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train MLP Measurement Model with Analytical HEF PM on S1')
-    parser.add_argument('--batch_size', type=int, default=45, help='Batch size for training')
-    parser.add_argument('--n_trajs', type=int, default=300, help='Number of trajectories')
-    parser.add_argument('--traj_len', type=int, default=30, help='Length of each trajectory')
-    parser.add_argument('--noise_z', type=float, default=0.2, help='Measurement noise (Gaussian)')
-    parser.add_argument('--noise_p', type=float, default=0.2, help='Process noise')
+    parser.add_argument('--batch_size', type=int, default=100, help='Batch size for training')
+    parser.add_argument('--n_trajs', type=int, default=1000,help='Number of trajectories')
+    parser.add_argument('--traj_len', type=int, default=30,help='Length of each trajectory')
+    parser.add_argument('--noise_z', type=float, default=0.3, help='Measurement noise (Gaussian)')
+    parser.add_argument('--noise_p', type=float, default=0.1, help='Process noise')
     parser.add_argument('--initial_cov', type=float, default=0.01, help='Initial covariance')
-    parser.add_argument('--band_limit', type=int, default=30, help='Band limit')
+    parser.add_argument('--band_limit', type=int, default=60, help='Band limit')
     parser.add_argument('--step_size', type=float, default=0.1, help='Step size')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--num_epochs', type=int, default=1000, help='Number of epochs')
-    parser.add_argument('--input_cov_z', type=float, default=0.01, help='Input covariance for Z')
+    parser.add_argument('--num_epochs', type=int, default=800, help='Number of epochs')
+    parser.add_argument('--input_cov_z', type=float, default=0.2, help='Input covariance for Z')
     parser.add_argument('--initial_lambda', type=float, default=0.7, help='Initial lambda for decay loss')
     parser.add_argument('--decay_rate', type=float, default=0.5, help='Decay rate for lambda decay loss')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--decay_lambda', type=int, choices=[0, 1], default=0,
                         help='flag set to true do lambda decay for the loss')
-    parser.add_argument('--true_cov', type=float, default=0.04, help='True covariance for Z')
     parser.add_argument('--model_path', type=str, default=None, help='Path to the pre-trained model')
+    parser.add_argument('--model_path_gp_mm', type=str, default=None, help='Path to the pre-trained GP measurement model')
+    parser.add_argument('--model_path_lstm', type=str, default=None, help='Path to the pre-trained LSTM model')
+    parser.add_argument('--learning_rate_end', type=float, default=0.0001, help='End learning rate for decay')
+    parser.add_argument('--lr_factor', type=float, default=10, help='Factor for learning rate decay')
+    parser.add_argument('--num_epochs_ekf', type=float, default=1000, help='Factor for learning rate decay')
+    
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     torch.manual_seed(args.seed)
+    args.sample_size = 100
 
     # If you are using CUDA
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
 
-    wandb.init(project="Diff-HEF", entity="korra141",
-               tags=["s1filter", "analytical_PM", "pretrained_MM", "overconfident MM HEF", "uncerconfident PM HEF"],
+    wandb.init(mode="disabled",project="Diff-HEF", entity="korra141",
+               tags=["s1filter", "analytical_PM", "pretrained_MM", "underconfident","gaussian homescedastic noise"],
                name="s1_filter_with_learning_MM",
                config=args)
-    main(args)
+     
+    c_time = time.strftime("%Y_%m_%d_%H_%M_%S")
+    folder_path = f"{base_path}/logs/s1_filter/{c_time}"
+    os.makedirs(folder_path, exist_ok=True)
+    print(f"Saving logs to {folder_path}")
+    train_loader,test_loader, val_loader = generating_data_S1(args.batch_size, args.n_trajs, args.traj_len, args.noise_z, True, args.step_size, True)
+    if args.model_path is None:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Submit tasks to be executed in parallel
+            # future1 = executor.submit(train, args, train_loader, val_loader, folder_path)
+            future2 = executor.submit(train_ekf, args, train_loader, val_loader, folder_path)
+            # Wait for the tasks to complete and get results
+            # measurement_model_hef = future1.result()
+            measurement_model_ekf = future2.result()
+        # main(args, folder_path, test_loader, None,measurement_model_ekf)
+    else:
+        main(args, folder_path, test_loader)

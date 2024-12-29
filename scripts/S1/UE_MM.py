@@ -38,7 +38,7 @@ sys.path.append(base_path)
 
 from src.data_generation.S1.toy_dataset import generating_data_S1_multimodal
 from src.distributions.S1.HarmonicExponentialDistribution import HarmonicExponentialDistribution
-from src.distributions.S1.WrappedNormalDitribution import MultimodalGaussianDistribution,MultimodalGaussianDistribution_torch
+from src.distributions.S1.WrappedNormalDitribution import MultimodalGaussianDistribution,MultimodalGaussianDistribution_torch,MultimodalWrappedNormalDistribution
 from src.utils.visualisation import plot_circular_distribution
 from src.utils.metrics import kl_divergence_s1,root_mean_square_error_s1,mean_absolute_error, expected_calibration_error_continuous, compute_cdf_from_pdf, predicted_residual_error, wasserstein_distance,expected_calibration_error, sharpness_discrete
 
@@ -47,8 +47,8 @@ def parse_args():
     parser.add_argument('--input_size', type=int, default=1, help='Input dimensionality')
     parser.add_argument('--hidden_size', type=int, default=10, help='Number of neurons in the hidden layer')
     # parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--band_limit', type=int, default=100, help='Band limit')
+    parser.add_argument('--num_epochs', type=int, default=1000, help='Number of epochs')
+    parser.add_argument('--band_limit', type=int, default=60, help='Band limit')
     parser.add_argument('--batch_size', type=int, default=100, help='Batch size')
     parser.add_argument('--n_samples', type=int, default=1000, help='Number of samples')
     parser.add_argument('--trajectory_length', type=int, default=100, help='Length of each trajectory')
@@ -56,14 +56,14 @@ def parse_args():
     # parser.add_argument('--measurement_noise_max', type=float, default=0.1, help='Standard deviation of the measurement noise')
     parser.add_argument('--step_size', type=float, default=0.1, help='Step between poses in trajectory')
     parser.add_argument("--mean_offset", type=float, default=0.785, help="Mean offset for the multimodal noise")
-    parser.add_argument("--n_modes", type=int, default=3, help="Number of modes for the multimodal noise")
-    parser.add_argument("--n_modes_estimated", type=int, default=6, help="Number of modes to be estimated by the model")
+    parser.add_argument("--n_modes", type=int, default=2, help="Number of modes for the multimodal noise")
+    parser.add_argument("--n_modes_estimated", type=int, default=10, help="Number of modes to be estimated by the model")
     parser.add_argument('--range_theta', type=str, default="None", help='Range of theta for local grid')
     parser.add_argument('--gaussian_parameterisation', type=int, default=0, help='Use Gaussian parameterisation')
     parser.add_argument('--gaussianNLL', type=int, default=0, help='Use Gaussian Negative Log Likelihood')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--learning_rate_start', type=float, default=0.001, help='Initial learning rate for decay')
-    parser.add_argument('--learning_rate_end', type=float, default=0.0001, help='Final learning rate for decay')
+    parser.add_argument('--learning_rate_end', type=float, default=0.00001, help='Final learning rate for decay')
     parser.add_argument('--lambda_start', type=float, default=100, help='Initial lambda for regularization')
     parser.add_argument('--lr_factor', type=float, default=10, help='Factor for learning rate decay')
     parser.add_argument('--reg_factor', type=float, default=0, help='Factor for regularization decay')
@@ -80,12 +80,18 @@ class EnergyNetwork(nn.Module):
         super(EnergyNetwork, self).__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_size, output_size)
+        self.fc2 = nn.Linear(hidden_size, 20)
+        self.fc3 = nn.Linear(20, hidden_size)
+        self.fc4 = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
         out = self.fc1(x)
         out = self.relu(out)
         out = self.fc2(out)
+        out = self.relu(out)
+        out = self.fc3(out)
+        out = self.relu(out)
+        out = self.fc4(out)
         return out
         #     self.model = nn.Sequential(
     #         nn.Linear(1, 8),
@@ -203,7 +209,7 @@ def validate(model, val_loader, args, hed,centers,measurement_noise,logging_path
         true_density = true_distribution.density()
       else:
         true_density = true_distribution.density_local(args.range_theta)
-      true_nll += true_distribution.negative_loglikelihood(measurements.numpy())
+      true_nll += true_distribution.negative_loglikelihood(measurements)
       val_kl_div_tot += kl_divergence_s1(true_density, predicted_density)
       wd_tot += wasserstein_distance(predicted_density, true_density)
       
@@ -319,7 +325,7 @@ def main(args):
         lambda_ = lambda_scheduler(epoch)
         print("loss regulariser",lambda_)
       start_epoch_time = time.time()
-      validate(model, val_loader, args, hed, centers,measurement_noise,logging_path,epoch)
+      # validate(model, val_loader, args, hed, centers,measurement_noise,logging_path,epoch)
       sample_batch = np.random.choice(len(train_loader),1).item()
       for i, (ground_truth, measurements) in enumerate(train_loader):
             start_time = time.time()
@@ -328,7 +334,7 @@ def main(args):
             if args.gaussian_parameterisation:
               mu, logcov, pi = model(ground_truth)
               cov = torch.nn.functional.softplus(logcov) + 1e-6
-              predicted_distribution = MultimodalGaussianDistribution_torch(mu, cov, pi, args.n_modes_estimated, args.band_limit)
+              predicted_distribution = MultimodalWrappedNormalDistribution(mu, cov, pi, args.n_modes_estimated, args.band_limit)
               if(torch.isnan(pi).any()):
                 print("pi is inf")
               # cov  = torch.exp(log_cov)
@@ -389,21 +395,21 @@ def main(args):
             else:
               raise ValueError("Invalid combination of parameters")
              #(batch_size, n_modes, 1)
-            true_distribution = MultimodalGaussianDistribution(mm_mean,measurement_noise,args.weights, args.n_modes,args.band_limit)
-            true_distribution_energy = true_distribution.energy()
+            true_distribution = MultimodalWrappedNormalDistribution(mm_mean,measurement_noise,args.weights, args.n_modes,args.band_limit)
+            true_distribution_energy = true_distribution.energy_1cov()
             if args.range_theta == None:
-              true_distribution_density = true_distribution.density()
+              true_distribution_density = true_distribution.density_1cov()
             else:
               true_distribution_density = true_distribution.density_local(args.range_theta)
             
             ece = expected_calibration_error(predicted_density, true_distribution_density, M=10)
             ece_tot += ece
             sharpness += sharpness_discrete(predicted_density)
-            true_nll += true_distribution.negative_loglikelihood(measurements.numpy())
+            true_nll += true_distribution.negative_loglikelihood_1cov(measurements)
             kl_div_tot += kl_divergence_s1(true_distribution_density, predicted_density)
             wd_tot += wasserstein_distance(predicted_density, true_distribution_density)
             
-            if (epoch % 100 == 0 or epoch == args.num_epochs -1) and i  == sample_batch:
+            if (epoch == args.num_epochs -1) and i  == sample_batch:
               indices = np.random.choice(args.batch_size, 5, replace=False)
               for j in indices:
                 fig, ax = plt.subplots()
@@ -458,22 +464,27 @@ def main(args):
             nll_tot += nll.item()
       print(f"Epoch {epoch + 1}, Loss: {loss_tot / len(train_loader)}, KL divergence: {kl_div_tot / len(train_loader)}")
       print(f"True Nll: {true_nll / len(train_loader)}")
-      metrics = {
-          'Epoch': epoch + 1,
-          'NLL' : nll_tot / len(train_loader),
-          'True NLL': true_nll / len(train_loader),
-          'Loss': loss_tot / len(train_loader),
-          'KL Divergence': kl_div_tot / len(train_loader),
-          #'RMSE Mu': rmse_mu_tot / len(train_loader),
-          #'MAE Mu':mae_mu_tot / len(train_loader),
-          'ECE': ece_tot / len(train_loader), 
-          'Sharpness': sharpness / len(train_loader),
-          'Wasserstein Distance': wd_tot / len(train_loader)}
-        # Log all the generated images to wandb
-#if args.gaussian_parameterisation:
-      #    metrics['RMSE Cov'] = rmse_cov / len(train_loader)
-      wandb.log(metrics)
+      if epoch % 100 == 0:
+        metrics = {
+            'Epoch': epoch + 1,
+            'NLL' : nll_tot / len(train_loader),
+            'True NLL': true_nll / len(train_loader),
+            'Loss': loss_tot / len(train_loader),
+            'KL Divergence': kl_div_tot / len(train_loader),
+            #'RMSE Mu': rmse_mu_tot / len(train_loader),
+            #'MAE Mu':mae_mu_tot / len(train_loader),
+            'ECE': ece_tot / len(train_loader), 
+            'Sharpness': sharpness / len(train_loader),
+            'Wasserstein Distance': wd_tot / len(train_loader)}
+          # Log all the generated images to wandb
+  #if args.gaussian_parameterisation:
+        #    metrics['RMSE Cov'] = rmse_cov / len(train_loader)
+        wandb.log(metrics)
     print("Training finished!")
+    model_save_path = os.path.join(logging_path, 'model.pth')
+    torch.save(model.state_dict(), model_save_path)
+    print(f"Model saved to {model_save_path}")
+    wandb.save(model_save_path)
     for img_file in os.listdir(logging_path):
       print(img_file)
       if img_file.endswith(".pkl"):
@@ -499,7 +510,7 @@ if __name__ == '__main__':
             tags=["S1","UncertainityEstimation","MultimodalNoise"],
             name="S1-UncertainityEstimation",
             config=args)
-  artifact = wandb.Artifact("UE_mm_script_3", type="mm_script")
+  artifact = wandb.Artifact("UE_mm_script_7", type="mm_script")
   artifact.add_file(__file__)
   run.log_artifact(artifact)
   main(args)

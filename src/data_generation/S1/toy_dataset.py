@@ -205,7 +205,7 @@ def sample_mm(n_modes, mean, std, n_samples):
     noise_point = np.random.normal(loc=mean[selected_mode], scale=std[selected_mode])
     return noise_point
 
-def generating_data_S1_multimodal(measurement_noise, mean_offset,n_modes,base_path, batch_size, n_samples, trajectory_length, step=0.1, shuffle_flag=True):
+def generating_data_S1_multimodal(measurement_noise, mean_offset,n_modes,base_path, batch_size, n_samples, trajectory_length, step=0.1, shuffle_flag=True, flattend=True):
   """Generates training data for a system with circular motion.
 
   Args:
@@ -219,7 +219,7 @@ def generating_data_S1_multimodal(measurement_noise, mean_offset,n_modes,base_pa
   Returns:
     Flattened pose and noisy measurement data in a TensorDataset.
   """
-  data_path = os.path.join(base_path, f's1_toy_dataset_flattened_{n_samples * trajectory_length}_mean{mean_offset:.4f}_mm_noise{measurement_noise}_step{step}.pt')
+  data_path = os.path.join(base_path, f's1_toy_dataset_flattened_{flattend}_{n_samples * trajectory_length}_mean{mean_offset:.4f}_mm_noise{measurement_noise}_step{step}.pt')
   if not os.path.exists(data_path):
     print('Generating Data at:', data_path) 
     starting_positions = np.linspace(0, 2 * np.pi, n_samples, endpoint=False)
@@ -241,9 +241,12 @@ def generating_data_S1_multimodal(measurement_noise, mean_offset,n_modes,base_pa
 
     measurements_ = torch.from_numpy(measurements)
     ground_truth_ = torch.from_numpy(true_trajectories)
-    ground_truth_flatten = torch.flatten(ground_truth_)[:, None].type(torch.FloatTensor)
-    measurements_flatten = torch.flatten(measurements_)[:, None].type(torch.FloatTensor)
-    train_dataset = torch.utils.data.TensorDataset(ground_truth_flatten, measurements_flatten)
+    if flattend:
+        ground_truth_flatten = torch.flatten(ground_truth_)[:, None].type(torch.FloatTensor)
+        measurements_flatten = torch.flatten(measurements_)[:, None].type(torch.FloatTensor)
+        train_dataset = torch.utils.data.TensorDataset(ground_truth_flatten, measurements_flatten)
+    else:
+        train_dataset = torch.utils.data.TensorDataset(ground_truth_.unsqueeze(-1), measurements_.unsqueeze(-1))
     torch.save(train_dataset, data_path)
   else:
     print('Loading Data')

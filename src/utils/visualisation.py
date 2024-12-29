@@ -286,7 +286,6 @@ def plotting_von_mises(mu,cov,grid_size,ax,legend):
 
     # pdb.set_trace()
     mu = mu.item()
-    cov = cov
     kappa = 1 / cov
 
     theta = np.linspace(0, 2 * np.pi, grid_size+1)[:-1]
@@ -301,9 +300,11 @@ def plotting_von_mises(mu,cov,grid_size,ax,legend):
     prob_grid_x = np.cos(theta) * prob_grid_r
     prob_grid_y = np.sin(theta) * prob_grid_r
 
-    ax.plot(a, b)
-    ax.plot(prob_grid_x, prob_grid_y,label=legend)
-    ax.legend()
+    plt.axis('off')
+    # Set aspect ratio to equal, to create a perfect circle
+    ax.set_aspect('equal')
+    ax.plot(a, b, color='gray', linestyle='--', linewidth=1, alpha=0.6)
+    ax.plot(prob_grid_x, prob_grid_y, label=legend, linewidth=2, alpha=0.8)
 
     return ax
 

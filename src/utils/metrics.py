@@ -24,12 +24,33 @@ def kl_divergence_s1( p, q):
     q = torch.clamp(q, min=epsilon)
     return abs(torch.mean(torch.sum(p * torch.log(p / q),dim=-1)))
 
+def error_s1(p,q):
+    """
+    Calculate the Absolute Error between two distributions p and q.
+    Both p and q should be torch tensors of the same shape.
+    """
+    error = abs(p-q)
+    stacked_tensors = torch.stack((error, torch.ones_like(error)*2*math.pi - error), dim=-1)
+    # Find the minimum values across the last dimension
+    min_values, min_indices = torch.min(stacked_tensors, dim=-1)
+    error_sign = p - q > 0
+    signed_error = torch.where(
+        min_indices == 0,  # If minimum index is 0
+        min_values * (2 * error_sign.float() - 1),  # Apply original sign
+        min_values * (1 - 2 * error_sign.float())  # Apply opposite sign
+    )
+
+    return signed_error
+
 def absolute_error_s1(p,q):
     """
     Calculate the Absolute Error between two distributions p and q.
     Both p and q should be torch tensors of the same shape.
     """
-    error = abs(p - q)
+    if isinstance(p, torch.Tensor) or isinstance(q, torch.Tensor):
+        error = torch.abs(p - q)
+    else:
+        error = abs(p - q)
     stacked_tensors = torch.stack((error, torch.ones_like(error)*2*math.pi - error), dim=-1)
     # Find the minimum values across the last dimension
     min_values, min_indices = torch.min(stacked_tensors, dim=-1)
@@ -66,6 +87,35 @@ def wasserstein_distance(p, q):
     p_sorted, _ = torch.sort(p, dim=-1)
     q_sorted, _ = torch.sort(q, dim=-1)
     return torch.sum(torch.abs(p_sorted - q_sorted), dim=-1).mean()
+
+def kl_divergence_k(predicted_density, true_density, grid, epsilon=1e-12):
+    """ 
+    Compute the KL divergence for discrete distributions defined on a grid for a batch.
+    Parameters:
+    - predicted_density: torch.Tensor, shape (batch_size, num_grid_points), predicted densities (P)
+    - true_density: torch.Tensor, shape (batch_size, num_grid_points), true densities (Q)
+    - grid: torch.Tensor, shape (num_grid_points,), grid points corresponding to densities
+    - epsilon: float, small value to prevent numerical instability
+    Returns:
+    - kl_div: torch.Tensor, shape (batch_size,), KL divergence for each sample in the batch
+    """
+    # Add epsilon to avoid numerical issues
+    P = predicted_density.clamp(min=epsilon)
+    Q = true_density.clamp(min=epsilon)
+
+    # Normalize P and Q to ensure valid probability distributions
+    P = P / P.sum(dim=1, keepdim=True)
+    Q = Q / Q.sum(dim=1, keepdim=True)
+
+    # Compute the log term and handle grid spacing
+    kl_terms = P * torch.log(P / Q)
+    grid_diff = torch.diff(grid, prepend=grid[..., :1])  # Compute spacing between grid points
+
+    # Compute KL divergence as the weighted sum of terms
+    kl_div = torch.sum(kl_terms * grid_diff, dim=-1)
+
+    return torch.mean(kl_div)
+
 
 def predicted_residual_error(p, q, bins=10):
     """

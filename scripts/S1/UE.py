@@ -26,6 +26,8 @@ import wandb
 import sys
 import random
 import pdb
+import pickle as pkl
+import random
 base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(base_path)
 
@@ -42,11 +44,11 @@ def parse_args():
     parser.add_argument('--hidden_size', type=int, default=10, help='Number of neurons in the hidden layer')
     # parser.add_argument('--learning_rate', type=float, default=0.0001, help='Learning rate')
     parser.add_argument('--num_epochs', type=int, default=500, help='Number of epochs')
-    parser.add_argument('--band_limit', type=int, default=30, help='Band limit')
+    parser.add_argument('--band_limit', type=int, default=50, help='Band limit')
     parser.add_argument('--batch_size', type=int, default=100, help='Batch size')
     parser.add_argument('--n_samples', type=int, default=1000, help='Number of samples')
     parser.add_argument('--trajectory_length', type=int, default=100, help='Length of each trajectory')
-    parser.add_argument('--measurement_noise', type=float, default=0.2, help='Standard deviation of the measurement noise')
+    parser.add_argument('--measurement_noise', type=float, default=0.3, help='Standard deviation of the measurement noise')
     parser.add_argument('--step_size', type=float, default=0.1, help='Step between poses in trajectory')
     parser.add_argument('--range_theta', type=str, default="None", help='Range of theta for local grid')
     parser.add_argument('--gaussian_parameterisation', type=int, default=0, help='Use Gaussian parameterisation')
@@ -160,7 +162,7 @@ def validate(model, val_loader, args, hed,logging_path,epoch):
       wd_tot += wasserstein_distance(predicted_density, true_density)
       val_loss_tot += loss.item()
       if args.wandb and epoch % 50 == 0 and i == 0:
-        indices = np.random.choice(args.batch_size, 5, replace=False)
+        indices = np.random.choice(args.batch_size, 3, replace=False)
         for j in indices:
           fig, ax = plt.subplots()
           if args.range_theta == None and args.gaussian_parameterisation:
@@ -264,13 +266,13 @@ def main(args):
         lambda_ = lambda_scheduler(epoch)
         print("loss regulariser",lambda_)
       start_epoch_time = time.time()
-      # val_metrics = validate(model, val_loader, args, hed,logging_path,epoch)
-      # if args.wandb:
-      #   wandb.log(val_metrics,commit=False)
+      val_metrics = validate(model, val_loader, args, hed,logging_path,epoch)
+      if args.wandb and epoch % 10 == 0:
+        wandb.log(val_metrics,commit=False)
       sample_batch = np.random.choice(len(train_loader),1).item()
       for i, (ground_truth, measurements) in enumerate(train_loader):
           if args.gaussian_parameterisation:
-            mu, log_cov = model(ground_truth)
+            mu, log_cov = model(measurements)
             cov = torch.exp(log_cov)
             predicted_distribution = VonMissesDistribution_torch(mu, cov,args.band_limit)
             energy = predicted_distribution.energy()
@@ -284,7 +286,7 @@ def main(args):
             rmse_cov += root_mean_square_error_s1(cov_,measurement_cov)
             mae_mu = mean_absolute_error(mu_,ground_truth)
           else:
-            energy = model(ground_truth)
+            energy = model(measurements)
             predicted_density = torch.exp(energy - hed.normalization_constant(energy))
             mode = hed.mode(predicted_density,ground_truth)
             error, hist, bin_centers, bin_edges = predicted_residual_error(mode, ground_truth,20)
@@ -296,14 +298,16 @@ def main(args):
         # Compute the loss
           if args.gaussianNLL == 0:
             if args.range_theta == None:
-              nll = hed.negative_log_likelihood(energy, measurements)
-              loss = hed.loss_regularisation_norm(lambda_,energy,measurements,scaling_factor=1/args.lambda_start)
+              nll = hed.negative_log_likelihood(energy, ground_truth)
+              loss = torch.mean(nll)
+              # loss = hed.loss_regularisation_norm(lambda_,energy,measurements,scaling_factor=1/args.lambda_start)
             else:
-              nll = hed.negative_log_likelihood_local(energy, measurements, ground_truth)
-              loss = hed.loss_regularisation_norm(lambda_,energy,measurements,ground_truth,scaling_factor=1/args.lambda_start)
+               pass
+              # nll = hed.negative_log_likelihood_local(energy, measurements, ground_truth)
+              # loss = hed.loss_regularisation_norm(lambda_,energy,measurements,ground_truth,scaling_factor=1/args.lambda_start)
 
           elif (args.gaussian_parameterisation and args.gaussianNLL) == 1:
-            loss = predicted_distribution.negative_loglikelihood(measurements)
+            loss = predicted_distribution.negative_loglikelihood(ground_truth)
             nll = loss
           else:
             raise ValueError("Invalid combination of parameters")
@@ -312,31 +316,41 @@ def main(args):
             true_density = true_distribution.density()
           else:
             true_density = true_distribution.density_local(args.range_theta)
-          ece = expected_calibration_error(predicted_density, true_density, M=10)
-          ece_tot += ece
+          # ece = expected_calibration_error(predicted_density, true_density, M=10)
+          # ece_tot += ece
           sharpness += sharpness_discrete(predicted_density)
           true_nll += true_distribution.negative_loglikelihood(measurements.numpy())
           kl_div_tot += kl_divergence_s1(true_density, predicted_density)
           wd_tot += wasserstein_distance(predicted_density, true_density)
-          # if args.wandb and epoch % 50 == 0 and i == sample_batch:
-          #   indices = np.random.choice(args.batch_size, 5, replace=False)
-          #   for j in indices:
-          #     fig, ax = plt.subplots()
-          #     if args.range_theta == None and args.gaussian_parameterisation:
-          #       ax = plotting_von_mises(mu_[j],cov_.numpy()[j], args.band_limit,ax,"predicted distribution")
-          #     elif args.range_theta == None and args.gaussian_parameterisation == 0:
-          #       ax = plot_circular_distribution(energy[j],legend="predicted distribution",ax=ax)
-          #     else:
-          #       ax = plot_circular_distribution(energy[j],legend="predicted distribution",mean=ground_truth[j,0],range_theta=args.range_theta,ax=ax)
-          #     ax = plotting_von_mises(ground_truth[j],args.measurement_noise**2 , args.band_limit,ax,"true distribution")
-          #     ax.plot(torch.cos(measurements[j]),torch.sin(measurements[j]),'o',label="measurement data")
-          #     ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
-          #     ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
-          #     ax.legend(bbox_to_anchor=(0.85, 1), loc='upper left', fontsize='x-small')
-          #     ax.set_aspect('equal')
-          #     plt.savefig(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.png"), format='png', dpi=300)
-          #     # plt.show()
-          #     plt.close()
+          if args.wandb and epoch % 50 == 0 and i == sample_batch:
+            indices = np.random.choice(args.batch_size, 3, replace=False)
+            for j in indices:
+              fig, ax = plt.subplots()
+              if args.range_theta == None and args.gaussian_parameterisation:
+                ax = plotting_von_mises(mu_[j],cov_.numpy()[j], args.band_limit,ax,"predicted distribution")
+              elif args.range_theta == None and args.gaussian_parameterisation == 0:
+                ax = plot_circular_distribution(energy[j],legend="predicted distribution",ax=ax)
+              else:
+                ax = plot_circular_distribution(energy[j],legend="predicted distribution",mean=ground_truth[j,0],range_theta=args.range_theta,ax=ax)
+              ax = plotting_von_mises(ground_truth[j],args.measurement_noise**2 , args.band_limit,ax,"true distribution")
+              ax.plot(torch.cos(measurements[j]),torch.sin(measurements[j]),'o',label="measurement data")
+              ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
+              ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
+              ax.legend(bbox_to_anchor=(0.85, 1), loc='upper left', fontsize='x-small')
+              ax.set_aspect('equal')
+              plt.savefig(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.png"), format='png', dpi=300)
+              # plt.show()
+              plt.close()
+              plot_dict = {}
+              plot_dict["groundtruth"] = ground_truth[j]
+              plot_dict["measurement"] = measurements[j]
+              # plot_dict["true_dist_energy"] = true_distribution_energy[j]
+              plot_dict["predicted_dist_energy"] = energy[j]
+              with open(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.pkl"), "wb") as f:
+                    pkl.dump(plot_dict, f)
+                    print(os.path.join(logging_path, f"training_epoch_{epoch}_batch_{i}_sample_{j}.pkl"))
+              
+
           #   plt.bar(bin_centers.numpy(), hist.numpy(), width=(bin_edges[1] - bin_edges[0]).item(), edgecolor='black', align='center')
           #   plt.axvline(x=mae_mu, color='r', linestyle='-', label='MAE')
           #   plt.legend()
@@ -381,13 +395,13 @@ def main(args):
     
     print(f"Training took {time.time() - start_time} seconds")
     # Log all the generated images to wandb
-    # if args.wandb:
-    #   print("Logging images to wandb")
-    #   start_wandb_time = time.time()
-    #   for img_file in os.listdir(logging_path):
-    #       if img_file.endswith(".png"):
-    #           wandb.log({f"{img_file}": wandb.Image(os.path.join(logging_path, img_file))})
-    #   print(f"Logging images to wandb took {time.time() - start_wandb_time} seconds")
+    if args.wandb:
+      print("Logging images to wandb")
+      start_wandb_time = time.time()
+      for img_file in os.listdir(logging_path):
+          if img_file.endswith(".png"):
+              wandb.log({f"{img_file}": wandb.Image(os.path.join(logging_path, img_file))})
+      print(f"Logging images to wandb took {time.time() - start_wandb_time} seconds")
     
 
 

@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument('--input_size', type=int, default=1, help='Input dimensionality')
     parser.add_argument('--hidden_size', type=int, default=10, help='Number of neurons in the hidden layer')
     # parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--num_epochs', type=int, default=1000, help='Number of epochs')
+    parser.add_argument('--num_epochs', type=int, default=500, help='Number of epochs')
     parser.add_argument('--band_limit', type=int, default=100, help='Band limit')
     parser.add_argument('--batch_size', type=int, default=100, help='Batch size')
     parser.add_argument('--n_samples', type=int, default=1000, help='Number of samples')
@@ -239,11 +239,10 @@ def main(args):
 
     if args.range_theta is not None and (args.gaussian_parameterisation == 1 or args.gaussianNLL == 1):
       raise ValueError("Invalid combination of parameters: range_theta cannot be used with gaussian_parameterisation or gaussianNLL")
-    
-    if args.alpha <= 0 or args.beta <= 0:
-      raise ValueError("Alpha and beta must be positive")
-
+    non_gaussian = False
     if args.alpha is not None and args.beta is not None:
+      if args.alpha <= 0 or args.beta <= 0:
+        raise ValueError("Alpha and beta must be positive")
       non_gaussian=True
     # Generate training data
     data_path =  os.path.join(base_path, 'data')
@@ -360,6 +359,7 @@ def main(args):
                 true_density = true_distribution.density()
               else:
                 true_density = true_distribution.density_local(args.range_theta)
+              true_density_plot = true_distribution.density()
           kl_div_tot += kl_divergence_s1(true_density, predicted_density)
           ece = expected_calibration_error(predicted_density, true_density, M=10)
           ece_tot += ece
@@ -431,6 +431,10 @@ def main(args):
           metrics['RMSE Cov'] = rmse_cov / len(train_loader)
         wandb.log(metrics)
     print("Training finished!")
+    model_save_path = os.path.join(logging_path, 'model.pth')
+    torch.save(model.state_dict(), model_save_path)
+    print(f"Model saved to {model_save_path}")
+    wandb.save(model_save_path)
     print(f"Training took {time.time() - start_time} seconds")
     # Log all the generated images to wandb
     for img_file in os.listdir(logging_path):

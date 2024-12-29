@@ -8,6 +8,7 @@ from time import strftime, localtime
 import random
 import matplotlib.pyplot as plt
 import math
+import pdb
 
 
 base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,14 +41,13 @@ def generating_data_S1(batch_size, n_samples, trajectory_length, measurement_noi
         for i in range(n_samples):
             # Generate a circular trajectory with a random starting position.
             initial_angle = starting_positions[i]
-            trajectory = initial_angle + np.arange(trajectory_length) * step
+            trajectory = (initial_angle + np.arange(trajectory_length) * step) % (2 * np.pi)
             true_trajectories[i] = trajectory
-
             # Add Gaussian noise to the measurements.
-            measurements[i] = (trajectory + np.random.normal(0, measurement_noise, trajectory_length)) % (2 * np.pi)
+            measurements[i] = (trajectory + np.random.normal(0, measurement_noise, trajectory_length) + np.ones_like(trajectory)*(2*math.pi)) % (2 * np.pi)
 
-        measurements_ = torch.from_numpy(measurements % (2 * np.pi))[:, :, None].type(torch.FloatTensor)
-        ground_truth_ = torch.from_numpy(true_trajectories % (2 * np.pi))[:, :, None].type(torch.FloatTensor)
+        measurements_ = torch.from_numpy(measurements)[:, :, None].type(torch.FloatTensor)
+        ground_truth_ = torch.from_numpy(true_trajectories)[:, :, None].type(torch.FloatTensor)
         # ground_truth_flatten = torch.flatten(ground_truth_)[:, None].type(torch.FloatTensor)
         # measurements_flatten = torch.flatten(measurements_)[:, None].type(torch.FloatTensor)
         train_dataset = torch.utils.data.TensorDataset(ground_truth_, measurements_)
@@ -168,9 +168,9 @@ if __name__ == "__main__":
     noise_p = 0.2
     model_path = None
     mean_offset = 0.785
-    measurement_noise = 0.2
+    measurement_noise = 0.3
     n_modes = 2
-    measurement_noise = torch.ones(n_modes) * measurement_noise
+    # measurement_noise = torch.ones(n_modes) * measurement_noise
     data_path = os.path.join(base_path, 'data')
 
 
@@ -178,8 +178,8 @@ if __name__ == "__main__":
 
     # Create the LSTM filter
     lstm_filter = LSTMFilter()
-    train_loader = generating_data_S1_multimodal(measurement_noise, mean_offset,n_modes,data_path, batch_size, n_trajs, traj_len, step=0.1, shuffle_flag=True, flattend=False)
-    # train_loader,test_loader = generating_data_S1(batch_size, n_trajs, traj_len, noise_z, True, step_size, True)
+    # train_loader = generating_data_S1_multimodal(measurement_noise, mean_offset,n_modes,data_path, batch_size, n_trajs, traj_len, step=0.1, shuffle_flag=True, flattend=False)
+    train_loader,test_loader = generating_data_S1(batch_size, n_trajs, traj_len, measurement_noise, True, step_size, True)
 
     # loss_fn = nn.MSELoss()
     optimizer = torch.optim.Adam(lstm_filter.parameters(), lr=lr)
@@ -200,7 +200,8 @@ if __name__ == "__main__":
                 measurements = measurements.type(torch.FloatTensor)
                 # print(ground_truth.shape)
                 # print(measurements.shape)
-                control = torch.ones((batch_size, 1, 1)) * step_size + torch.normal(0, noise_p, size=(batch_size, traj_len, 1))  # Noisy Control
+                control = torch.ones((batch_size, traj_len, 1)) * step_size 
+                # + torch.normal(0, noise_p, size=(batch_size, traj_len, 1))  # Noisy Control
                 optimizer.zero_grad()
                 # print(ground_truth.shape)
                 initial_state = ground_truth[:, 0, :]  # Initial state

@@ -19,7 +19,7 @@ class T1FFT():
         # Shift zero frequency component to the center
         fhat = torch.fft.fftshift(fhat, dim=axis)
         # Normalize
-        return fhat / f.shape[axis]
+        return fhat/f.shape[axis]
 
     @staticmethod
     def synthesize(f_hat, axis=0):
@@ -32,7 +32,6 @@ class T1FFT():
         """
         # Shift zero frequency component back to original position
         f_hat = torch.fft.ifftshift(f_hat * f_hat.shape[axis], dim=axis)
-        # Perform inverse FFT
         f = torch.fft.ifft(f_hat, dim=axis)
         return f
 

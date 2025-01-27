@@ -125,7 +125,8 @@ class VonMissesDistribution_torch:
         return torch.mean(- kappa * torch.cos(value - self.mean) + torch.log(torch.tensor(2*math.pi)) + self.safe_i0(kappa, log_i0=True))
     
     def density(self):
-        grid = torch.tile(torch.linspace(0, 2*math.pi, self.band_limit+1)[:-1][None,:],(self.batch_size, 1))
+        # pdb.set_trace()
+        grid = torch.tile(torch.linspace(0, 2*math.pi, self.band_limit+1)[:-1][None,:],(self.batch_size, 1)).to(self.mean.device)
         kappa = (1/(self.cov))
         mean = self.mean
         density = torch.exp(kappa * torch.cos(grid - mean)) / (2 * math.pi * self.safe_i0(kappa))

@@ -54,7 +54,7 @@ class T2FFT():
         f_hat = torch.fft.fftshift(f_hat, dim=axes)
         # Normalize
         size = torch.prod(torch.tensor([f.shape[ax] for ax in axes], dtype=torch.float32))
-        return f_hat / size
+        return f_hat  / size
 
     @staticmethod
     def synthesize(f_hat, axes=(0, 1)):
@@ -67,6 +67,7 @@ class T2FFT():
         size = torch.prod(torch.tensor([f_hat.shape[ax] for ax in axes], dtype=torch.float32))
         # Shift zero frequency component back to original position
         f_hat = torch.fft.ifftshift(f_hat * size, dim=axes)
+#         f_hat = torch.fft.ifftshift(f_hat, dim=axes)
         # Perform inverse FFT
         f = torch.fft.ifft2(f_hat, dim=axes)
         return f

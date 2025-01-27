@@ -2,6 +2,92 @@ import torch
 import pdb
 import math
 
+import torch
+
+def compute_weighted_mean(prob: torch.Tensor,
+                          poses: torch.Tensor,
+                          x: torch.Tensor,
+                          y: torch.Tensor,
+                          theta: torch.Tensor) -> torch.Tensor:
+    """
+    Compute weighted mean of a distribution
+    :return mean of distribution
+    """
+    # Compute mean
+    prob = prob.flatten()
+    prod = poses * prob[:, None]
+    prod = prod.view(x.size(0), x.size(1), x.size(2), 3)
+    
+    # Integrate x, y, theta
+    int_x = torch.trapz(prod, x=x.unsqueeze(-1), dim=0)
+    int_xy = torch.trapz(int_x, x=y[0, :, :].squeeze().unsqueeze(-1), dim=0)
+    int_xyz = torch.trapz(int_xy, x=theta[0, 0, :].squeeze().unsqueeze(-1), dim=0)
+    
+    return int_xyz
+
+def align(model, data):
+    """Align two trajectories using the method of Horn (closed-form).
+
+    Input:
+    model -- first trajectory (3xn)
+    data -- second trajectory (3xn)
+
+    Output:
+    rot -- rotation matrix (3x3)
+    trans -- translation vector (3x1)
+    trans_error -- translational error per point (1xn)
+
+    """
+    model_zerocentered = model - model.mean(1, keepdim=True)
+    data_zerocentered = data - data.mean(1, keepdim=True)
+
+    W = torch.zeros((3, 3), dtype=model.dtype, device=model.device)
+    for column in range(model.shape[1]):
+        W += torch.outer(model_zerocentered[:, column], data_zerocentered[:, column])
+    U, d, Vh = torch.linalg.svd(W.T)
+    S = torch.eye(3, dtype=model.dtype, device=model.device)
+    if (torch.det(U) * torch.det(Vh) < 0):
+        S[2, 2] = -1
+    rot = U @ S @ Vh
+    trans = data.mean(1, keepdim=True) - rot @ model.mean(1, keepdim=True)
+
+    model_aligned = rot @ model + trans
+    alignment_error = model - data
+
+    trans_error = torch.sqrt(torch.sum(alignment_error * alignment_error, 0))
+
+    return rot, trans, trans_error
+
+def rmse_se2(gt_trajectory_, trajectory_, scaling_factor=1.0, offset_x=0.0, offset_y=0.0):
+    # Convert to torch tensors
+    gt_trajectory = gt_trajectory_[:, :2].T
+    trajectory = trajectory_[:, :2].T
+
+    # Scale the gt trajectory
+    gt_trajectory[0, :] = (gt_trajectory[0, :] / scaling_factor) - offset_x
+    gt_trajectory[1, :] = (gt_trajectory[1, :] / scaling_factor) - offset_y
+    zeros = torch.zeros((1, gt_trajectory.shape[1]), dtype=torch.float32)
+
+    # Append zeros in third dimension as z coordinate
+    gt_trajectory = torch.vstack((gt_trajectory, zeros))
+
+    # Scale second trajectory
+    trajectory[0, :] = (trajectory[0, :] / scaling_factor) - offset_x
+    trajectory[1, :] = (trajectory[1, :] / scaling_factor) - offset_y
+    trajectory = torch.vstack((trajectory, zeros))
+
+    # Align trajectory
+    rot, trans, trans_error = align(trajectory, gt_trajectory)
+    rot = rot.to(torch.float32)
+    trans =trans.to(dtype=torch.float32)
+    aligned_trajectory = rot @ trajectory + trans
+
+    # Compute metrics
+    trans_error = trans_error.to(torch.float32)
+    metrics = torch.sqrt(torch.dot(trans_error, trans_error) / len(trans_error))
+
+    return metrics
+
 def kl_divergence( p, q):
 
     """

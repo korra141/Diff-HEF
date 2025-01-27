@@ -12,6 +12,20 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.distributions.S1.BetaDistribution import BetaDistribution
 
+def plot_distributions_s1(measurement_noise, band_limit, energy, ground_truth, measurements, epoch, i, j, logging_path):
+  fig, ax = plt.subplots()
+  measurements = measurements.cpu()
+  ground_truth = ground_truth.cpu()
+  ax = plot_circular_distribution(energy,legend="predicted distribution",ax=ax)
+  ax = plotting_von_mises(ground_truth[j], measurement_noise**2, band_limit, ax, "true distribution")
+  ax.plot(torch.cos(measurements[j]), torch.sin(measurements[j]), 'o', label="measurement data")
+  ax.plot(torch.cos(ground_truth[j]), torch.sin(ground_truth[j]), 'o', label="pose data")
+  ax.set_title(f"Epoch {epoch} Batch {i} Sample {j}", loc='center')
+  ax.legend(bbox_to_anchor=(0.85, 1), loc='upper left', fontsize='x-small')
+  ax.set_aspect('equal')
+  plt.savefig(os.path.join(logging_path, f"training_s1_epoch_{epoch}_batch_{i}_sample_{j}.png"), format='png', dpi=300)
+  plt.close(fig)
+
 def fit_grid_into_larger(mean, range_x_diff, range_y_diff, band_limit, output_density):
     """
     Fits a smaller grid (output_density) into a larger grid (complete_grid) robustly.
@@ -81,7 +95,7 @@ def plot_circular_distribution(energy_samples,mean=None,legend="predicted",ax=No
     moments = torch.fft.fft(torch.exp(energy_samples - maximum), dim=-1)
     ln_z_ = torch.log(L*moments[0] / grid_size).real.unsqueeze(-1) + maximum
     prob = torch.exp(energy_samples - ln_z_)
-    prob = prob.detach()
+    prob = prob.detach().cpu()
 
 
     # Working on unit circle
@@ -96,7 +110,7 @@ def plot_circular_distribution(energy_samples,mean=None,legend="predicted",ax=No
     # theta = torch.cat([theta, theta[0].unsqueeze(0)], 0)
     ct = torch.cos(theta)
     st = torch.sin(theta)
-    theta_1 = torch.linspace(0, 2*math.pi, 100)
+    theta_1 = torch.linspace(0, 2*math.pi, 100).to(energy_samples.device).cpu()
     theta_1 = torch.cat([theta_1, theta_1[0].unsqueeze(0)], 0)
     ct_1 = torch.cos(theta_1)
     st_1 = torch.sin(theta_1)
@@ -378,7 +392,7 @@ def plot_density(ground_truth,measurement,range_x,range_y,folder_path,dict_densi
 
 def histogram_density(measurements_2d, pose_2d, normalised_density, legend, ax):
 # Create a 2D histogram of the output energy distribution
-  im = ax.imshow(normalised_density.detach().numpy().T, cmap='viridis', origin='lower', extent=[-0.5, 0.5, -0.5, 0.5])
+  im = ax.imshow(normalised_density.detach().cpu().numpy().T, cmap='viridis', origin='lower', extent=[-0.5, 0.5, -0.5, 0.5])
   ax.set_title(legend)
   ax.scatter(measurements_2d[0].item(), measurements_2d[1].item(), color='red', label='Measurement', s=50)
   ax.scatter(pose_2d[0].item(), pose_2d[1].item(), color='blue', label='Pose', s=50)
@@ -394,13 +408,13 @@ def plot_3d_density(range_x,range_y,true_density,predicted_density,folder_path,t
   x = np.linspace(range_x[0], range_x[1], n_samples_x +1)[:-1]
   y = np.linspace(range_y[0], range_y[1], n_samples_y +1)[:-1]
   x, y = np.meshgrid(x, y)
-  temp_1 = axs[0].contour3D(x, y, true_density.numpy(), 50, cmap='viridis')
+  temp_1 = axs[0].contour3D(x, y, true_density.cpu().numpy(), 50, cmap='viridis')
 
   n_samples_x, n_samples_y = predicted_density.shape
   x = np.linspace(range_x[0], range_x[1], n_samples_x +1)[:-1]
   y = np.linspace(range_y[0], range_y[1], n_samples_y +1)[:-1]
   x, y = np.meshgrid(x, y)
-  temp = axs[1].contour3D(x, y, predicted_density.numpy(), 50, cmap='viridis')
+  temp = axs[1].contour3D(x, y, predicted_density.cpu().numpy(), 50, cmap='viridis')
 
   # Add labels and title
   axs[1].set_xlabel('x')

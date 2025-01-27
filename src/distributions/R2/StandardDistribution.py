@@ -37,6 +37,9 @@ class GaussianDistribution:
         # Convert to numpy arrays for compatibility (if needed)
         x = torch.tile(x.unsqueeze(0),(n_traj,1,1))  # Add batch dimension
         y = torch.tile(y.unsqueeze(0),(n_traj,1,1))
+
+        x = x.to(self.mean.device)
+        y = y.to(self.mean.device)
         # Calculate the true unnormalized density for each ground truth point in the batch
         exponent =  -((x - self.mean[:, 0:1, None])**2 / (2 * self.cov[:,0:1,None])) - ((y - self.mean[:, 1:2, None])**2 / (2 * self.cov[:,1:2,None]))
         sqrt_det_cov = torch.sqrt(self.cov[:, 0] * self.cov[:, 1])

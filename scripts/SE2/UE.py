@@ -18,6 +18,8 @@ from src.distributions.SE2.GaussianDistribution import GaussianSE2 as GaussianDi
 from src.distributions.S1.WrappedNormalDitribution import VonMissesDistribution,VonMissesDistribution_torch
 from src.distributions.SE2.SE2_FFT import SE2_FFT
 from src.utils.sampler import se2_grid_samples_torch
+from torch.utils.checkpoint import checkpoint
+
 
 
 
@@ -156,7 +158,7 @@ STEP_MOTION = SE2Group(0.05, 0.05, np.pi / 20)
 MOTION_NOISE = np.array([0.01, 0.01, 0.005])
 MEASUREMENT_NOISE = np.array([0.2, 0.2, 0.2])
 INITIAL_COV = np.array([0.01, 0.01, 0.01])
-batch_size = 50
+batch_size = 20
 validation_split = 0.2
 
 # Generate dataset
@@ -298,22 +300,22 @@ class IndependentDensityEstimator(nn.Module):
         
         # Sub-network for R2
         self.r2_network = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels=1, out_channels=2, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels=2, out_channels=2, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(in_channels=64, out_channels=1, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels=2, out_channels=1, kernel_size=3, padding=1),
             nn.ReLU()
         )
         
         # Sub-network for S1
         self.s1_network = nn.Sequential(
-            nn.Linear(grid_size[2], 64),  # Input: theta (1D)
+            nn.Linear(1, 10),  # Input: theta (1D)
             nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, grid_size[2]),  # Output: density on S1
-            nn.Softplus()  # Ensure non-negative density
+            # nn.Linear(64, 64),
+            # nn.ReLU(),
+            nn.Linear(10, grid_size[2]),  # Output: density on S1
+            nn.ReLU()  # Ensure non-negative density
         )
         
     def forward(self, r2_input, s1_input):
@@ -370,7 +372,8 @@ initialize_weights(model)
 model.train()  # Set the model to training mode
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-
+def forward_with_checkpoint(model, *inputs):
+    return checkpoint(model, *inputs)
 
 fft = SE2_FFT(spatial_grid_size=grid_size,
                   interpolation_method='spline',
@@ -385,6 +388,8 @@ poses, X, Y, T = se2_grid_samples_torch(batch_size ,grid_size)
 poses = poses.to(device)
 scaling_factor = 1
 sample_batch = 0
+accumulation_steps = 5
+scaler = torch.cuda.amp.GradScaler()
 for epoch in range(num_epochs):
     running_loss = 0.0
     true_nll_input_tot = 0.0
@@ -395,44 +400,58 @@ for epoch in range(num_epochs):
     start_time = time.time()
     for param_group in optimizer.param_groups:
         param_group['lr'] = learning_rate_decay
+    # print(f"Time take for learning rate decay {time.time() - start_time:.2f}s")
     for batch_idx, (inputs, targets) in enumerate(train_loader):
-        inputs, targets = inputs.to(device), targets.to(device)
-        initial_density = GaussianDistribution_se2(inputs.unsqueeze(1), inital_cov_se2 ,grid_size).density(poses)
-        initial_density = initial_density.reshape((batch_size, *grid_size))
-        initial_distribution_r2 = GaussianDistribution_r2(inputs[:,0:2], true_cov_r2.to(device),grid_size[0:2],x_range=[-0.5,0.5],y_range=[-0.5,0.5])
-        initial_density_r2 = initial_distribution_r2.density_over_grid().to(torch.float32)
-        # print(initial_density_r2.shape)
-        initial_distribution_s1 = VonMissesDistribution_torch(inputs[:,2].unsqueeze(-1), torch.tensor(INITIAL_COV[2]), grid_size[2])
-        initial_density_s1  = initial_distribution_s1.density()
-        # print(initial_density_s1.shape)
+        with torch.cuda.amp.autocast():
+            start_time_batch = time.time()
+            inputs, targets = inputs.to(device), targets.to(device)
+            initial_density = GaussianDistribution_se2(inputs.unsqueeze(1), inital_cov_se2 ,grid_size).density(poses)
+            initial_density = initial_density.reshape((batch_size, *grid_size))
+            initial_distribution_r2 = GaussianDistribution_r2(inputs[:,0:2], true_cov_r2.to(device),grid_size[0:2],x_range=[-0.5,0.5],y_range=[-0.5,0.5])
+            initial_density_r2 = initial_distribution_r2.density_over_grid().to(torch.float32)
+            # print(initial_density_r2.shape)
+            initial_distribution_s1 = VonMissesDistribution_torch(inputs[:,2].unsqueeze(-1), torch.tensor(INITIAL_COV[2]), grid_size[2])
+            initial_density_s1  = initial_distribution_s1.density()
+            # print(initial_density_s1.shape)
 
-        # Forward pass
-        # output = model(initial_density)
-        output, r2_density, s1_density = model(initial_density_r2.unsqueeze(1), initial_density_s1)
-        # print(output.shape)
-        _, z = fft.compute_moments_lnz(torch.log(output + 1e-8))
-        
-        output = output.to(device)
-        z = z.to(device).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        output_density = output/z
-        # Compute loss
-        nll = torch.mean(fft.neg_log_likelihood(torch.log(output_density + 1e-8), targets))
-        diff_dim1 = output_density[1:, :, :] - output_density[:-1, :, :]  # Differences along the first dimension
-        diff_dim2 = output_density[:, 1:, :] - output_density[:, :-1, :]  # Differences along the second dimension
-        diff_dim3 = output_density[:, :, 1:] - output_density[:, :, :-1]  # Differences along the third dimension
+            # Forward pass
+            # output = model(initial_density)
+            torch.cuda.synchronize()
+            start_time_forward = time.time()
+            initial_density_r2.requires_grad = True
+            inputs[:,2].requires_grad = True
+            output, r2_density, s1_density = forward_with_checkpoint(model, initial_density_r2.unsqueeze(1), inputs[:,2].unsqueeze(1))
+            # print(output)
+            torch.cuda.synchronize()
+            # print(f"Time taken for forward pass {time.time() - start_time_forward:.2f}s")
+            # print(output.shape)
+            start_time_fft = time.time()
+            _, z = fft.compute_moments_lnz(torch.log(output + 1e-8))
+            
+            output = output.to(device)
+            z = z.to(device).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            output_density = output/z
+            # Compute loss
+            nll = torch.mean(fft.neg_log_likelihood(torch.log(output_density + 1e-8), targets))
+            # print(f"Time taken for fft {time.time() - start_time_fft:.2f}s")
+        # diff_dim1 = output_density[1:, :, :] - output_density[:-1, :, :]  # Differences along the first dimension
+        # diff_dim2 = output_density[:, 1:, :] - output_density[:, :-1, :]  # Differences along the second dimension
+        # diff_dim3 = output_density[:, :, 1:] - output_density[:, :, :-1]  # Differences along the third dimension
 
-        # Smoothness loss: squared differences summed over all dimensions
-        smoothness_loss = (
-            torch.mean(diff_dim1 ** 2) +
-            torch.mean(diff_dim2 ** 2) +
-            torch.mean(diff_dim3 ** 2)
-        )
-        
-        loss = nll 
+        # # Smoothness loss: squared differences summed over all dimensions
+        # smoothness_loss = (
+        #     torch.mean(diff_dim1 ** 2) +
+        #     torch.mean(diff_dim2 ** 2) +
+        #     torch.mean(diff_dim3 ** 2)
+        # )
+            torch.cuda.synchronize()
+            start_time_backward = time.time()
+            loss = nll 
         # + scaling_factor * smoothness_loss
         # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
+        # optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        # loss.backward()
         # total_norm = 0.0
         # # for param in model.parameters():
         # #     if param.grad is not None:  # Check if the gradient is computed
@@ -441,8 +460,13 @@ for epoch in range(num_epochs):
 
         # total_norm = total_norm ** 0.5  # Final L2 norm
         # print("Gradient Norm (L2):", total_norm)
-        optimizer.step()
-        print(grid_size[:-1])
+        if (batch_idx + 1) % accumulation_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+        # optimizer.zero_grad()
+        # optimizer.step()
+        torch.cuda.synchronize()
+        # print(f"Time taken for backward pass {time.time() - start_time_backward:.2f}s")
         target_distribution_r2 = GaussianDistribution_r2(inputs[:,0:2], true_cov_r2.to(device),grid_size[:-1],x_range=[-0.5,0.5],y_range=[-0.5,0.5])
         true_density_plot_r2 = target_distribution_r2.density_over_grid()
 
@@ -454,9 +478,9 @@ for epoch in range(num_epochs):
 
         running_loss += loss.item()
         nll_tot += nll.item()
-        smoothness_tot += smoothness_loss.item()
+        # smoothness_tot += smoothness_loss.item()
         true_nll_input_tot += nll_se2.mean().item()
-        if epoch % 50 == 0 and batch_idx == sample_batch:
+        if epoch % 10 == 0 and batch_idx == sample_batch:
             indices = np.random.choice(batch_size, 3, replace=False)
             for j in indices:
                 plot_dict = {}
@@ -465,12 +489,11 @@ for epoch in range(num_epochs):
                     'predicted_density': r2_density[j],
                     # torch.sum(output_density[j],dim=2) * (2*math.pi/grid_size[2]),
                     }
-                print(plot_dict['predicted_density'].shape)
                 plot_density(inputs[j,0:2], targets[j,0:2],[-0.5,0.5],[-0.5,0.5],logging_path,plot_dict,f"training_r2_epoch_{epoch}_batch_{batch_idx}_sample{j}")
                 
                 # predicted_density = torch.sum(output_density[j],dim=(0,1)) * (1/grid_size[0]) * (1/grid_size[1])
                 plot_distributions_s1(MEASUREMENT_NOISE[2], grid_size[2], torch.log(s1_density[j] + 1e-10), inputs[:,2] + math.pi, targets[:,2] + math.pi, epoch, batch_idx, j, logging_path)
-
+        # print(f"Time taken for batch {time.time() - start_time_batch:.2f}s")
     epoch_loss = running_loss / len(train_loader)
     logging.info(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}, Estimated NLL: {nll_tot/ len(train_loader):.4f}, Smoothening Loss: {smoothness_tot/len(train_loader):.4f}, True NLL: {true_nll_input_tot/len(train_loader):.4f}, Time: {time.time() - start_time:.2f}s")
     

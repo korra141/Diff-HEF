@@ -1,0 +1,242 @@
+import torch
+import math
+import numpy as np
+# from scipy.stats import norm
+import pdb
+
+class HarmonicExponentialDistribution:
+    def __init__(self, bandwidth, step_size,range_x=None, range_y=None, range_x_diff=None,range_y_diff=None):
+        self.range_x = range_x
+        self.range_y = range_y
+        self.grid_size = bandwidth
+        self.step_t = step_size
+        if range_x_diff is None:
+            self.range_x_diff = self.range_x[1] - self.range_x[0]
+        else:
+            self.range_x_diff = range_x_diff
+        if range_y_diff is None:
+            self.range_y_diff = self.range_y[1] - self.range_y[0]
+        else:
+            self.range_y_diff = range_y_diff
+
+    def loss_regularisation_norm(self,lambda_,density,value,mean=None,scaling_factor=1):
+        if mean is None:
+            NLL = self.loss_energy(density,value)
+        else:
+            NLL = self.negative_log_likelihood_local_grid(density,value,mean)
+        grid_norm = torch.norm(density, p=1, dim=(1,2), keepdim=False, out=None)
+        max = torch.max(grid_norm)  
+        grid_norm = (grid_norm/max)*scaling_factor
+        return torch.mean(NLL + lambda_ * grid_norm)
+
+
+    def negative_log_likelihood_density(self,density,value):
+        """
+        Computes the negative log-likelihood density for a given density and value.
+        Args:
+            density (torch.Tensor): The density tensor of shape [batchsize, grid_size1, grid_size2].
+            value (torch.Tensor): The value tensor of shape [batchsize, 2], where each row represents a point (x, y).
+        Returns:
+            torch.Tensor: The mean negative log-likelihood density.
+        Note:
+            The value should lie on the grid. If it does not, this function will output an incorrect value since it does not use an interpolator.
+        """
+        
+        id_x = ((value[:,0] - self.range_x[0])/self.step_t[0]).to(torch.int).to(torch.float) # [batchsize]
+        id_y = ((value[:,1] - self.range_y[0])/self.step_t[1]).to(torch.int).to(torch.float)
+        
+
+        # It is more numerically stable to compute the log of the density and then exponentiate it.
+
+        energy = torch.log(density + 1e-40)
+        z = self.normalization_constant(density)
+        energy = energy  + torch.log(z)
+      
+        eta = torch.fft.fft2(energy)
+
+        k_x = torch.arange(self.grid_size[0]) 
+        k_y = torch.arange(self.grid_size[1])
+
+        temp_x = id_x.unsqueeze(-1) * k_x.unsqueeze(0) 
+        temp_y = id_y.unsqueeze(-1) * k_y.unsqueeze(0) 
+
+        exp_x = torch.exp(2j * math.pi * temp_x/self.grid_size[0])
+        exp_y = torch.exp(2j * math.pi * temp_y/self.grid_size[1])
+
+        temp_eta_y = torch.bmm(eta,exp_y.unsqueeze(-1)).squeeze(-1)
+
+        reconstructed = (torch.bmm(temp_eta_y.unsqueeze(1), exp_x.unsqueeze(-1)) / math.prod(self.grid_size)).real
+
+        # z = (torch.sum(density,dim=(1,2))*((range_x_diff * range_y_diff)/math.prod(grid_size))).unsqueeze(-1).unsqueeze(-1)
+
+        result = -reconstructed + torch.log(z)
+
+        # print("Integrating the distribution",torch.mean(torch.sum(density/z,dim=(1,2))*step_t[0]*step_t[1]))
+
+        return torch.mean(result.squeeze(-1))
+    
+    def negative_log_likelihood_local_grid(self, density,value,mean):
+        """
+        Computes the negative log-likelihood density for a given density and value.
+        Args:
+            density (torch.Tensor): The density tensor of shape [batchsize, grid_size1, grid_size2].
+            value (torch.Tensor): The value tensor of shape [batchsize, 2], where each row represents a point (x, y).
+        Returns:
+            torch.Tensor: The mean negative log-likelihood density.
+        Note:
+            The value should lie on the grid. If it does not, this function will output an incorrect value since it does not use an interpolator.
+        """
+
+        # It is more numerically stable to compute the log of the density and then exponentiate it.
+
+        energy = torch.log(density + 1e-40)
+
+        ln_z = self.normalization_constant_energy(energy)
+
+        eta = torch.fft.fft2(energy) #[batchsize,grid_size1, grid_size2]
+
+        k_x = torch.arange(self.grid_size[0])
+        k_y = torch.arange(self.grid_size[1])
+
+        x = (value[:,0] - mean[:,0] + self.range_x_diff/2)/self.range_x_diff
+        y = (value[:,1] - mean[:,1] + self.range_y_diff/2)/self.range_y_diff
+
+        temp_x = x.unsqueeze(-1) * k_x.unsqueeze(0)
+        temp_y = y.unsqueeze(-1) * k_y.unsqueeze(0)
+
+        exp_x = torch.exp(2j * math.pi * temp_x).unsqueeze(-1)
+        exp_y = torch.exp(2j * math.pi * temp_y).unsqueeze(1)
+
+        exp_x_y = torch.bmm(exp_x,exp_y)
+
+        reconstructed = ((eta * exp_x_y).sum(dim=1).sum(1) / math.prod(self.grid_size)).real
+        # print(reconstructed.shape)
+
+        # temp_eta_y = torch.bmm(eta,exp_y.unsqueeze(-1)).squeeze(-1)
+
+        # reconstructed = (torch.bmm(temp_eta_y.unsqueeze(1), exp_x.unsqueeze(-1))/math.prod(grid_size)).real
+
+        result = -reconstructed + ln_z
+        return result
+    
+    def loss_energy(self,density,value):
+        """
+        Computes the negative log-likelihood density for a given density and value.
+        Args:
+            density (torch.Tensor): The density tensor of shape [batchsize, grid_size1, grid_size2].
+            value (torch.Tensor): The value tensor of shape [batchsize, 2], where each row represents a point (x, y).
+        Returns:
+            torch.Tensor: The mean negative log-likelihood density.
+        Note:
+            The value should lie on the grid. If it does not, this function will output an incorrect value since it does not use an interpolator.
+        """
+        
+        # id_x = ((value[:,0] - self.range_x[0])/self.step_t[0]).to(torch.int).to(torch.float) # [batchsize]
+        # id_y = ((value[:,1] - self.range_y[0])/self.step_t[1]).to(torch.int).to(torch.float)
+        
+
+        # It is more numerically stable to compute the log of the density and then exponentiate it.
+
+        energy = torch.log(density + 1e-40)
+        ln_z = self.normalization_constant_energy(energy)
+        # print(z)
+        # energy = energy  + torch.log(z)
+      
+        eta = torch.fft.fft2(energy)
+
+        k_x = torch.arange(self.grid_size[0]).to(value.device)
+        k_y = torch.arange(self.grid_size[1]).to(value.device)
+
+        x = (value[:,0] - self.range_x[0])/self.range_x_diff
+        y = (value[:,1] - self.range_y[0])/self.range_y_diff
+
+        temp_x = x.unsqueeze(-1) * k_x.unsqueeze(0) 
+        temp_y = y.unsqueeze(-1) * k_y.unsqueeze(0) 
+
+        exp_x = torch.exp(2j * math.pi * temp_x)
+        exp_y = torch.exp(2j * math.pi * temp_y)
+
+        temp_eta_y = torch.bmm(eta,exp_y.unsqueeze(-1)).squeeze(-1)
+
+        reconstructed = (torch.bmm(temp_eta_y.unsqueeze(1), exp_x.unsqueeze(-1))/math.prod(self.grid_size)).real
+
+        # z = (torch.sum(density,dim=(1,2))*((range_x_diff * range_y_diff)/math.prod(grid_size))).unsqueeze(-1).unsqueeze(-1)
+
+        result = -reconstructed + ln_z
+
+        # print("Integrating the distribution",torch.mean(torch.sum(density/z,dim=(1,2))*step_t[0]*step_t[1]))
+
+        return result.squeeze(-1)
+
+    def normalization_constant(self,density):
+        moments = torch.fft.fft2(density)
+        z = (moments[:,0,0] * ((self.range_x_diff * self.range_y_diff) / math.prod(self.grid_size))).unsqueeze(-1).unsqueeze(-1)
+        return z.real
+    
+    def normalization_constant_energy(self,energy):
+        # min_energy = torch.min(energy, dim=-1, keepdim=True).values
+        # min_min_energy = torch.min(min_energy, dim=1, keepdim=True).values
+        # print(min_min_energy)
+        moments = torch.fft.fft2(torch.exp(energy))
+        # print(moments.isnan().any())
+        z = torch.log((moments[:,0,0].real * ((self.range_x_diff * self.range_y_diff) / math.prod(self.grid_size))).unsqueeze(-1).unsqueeze(-1))
+        return z
+    
+    def pad_for_fft_2d(self,tensor, target_shape):
+        pad_h = target_shape[0] - tensor.shape[1]
+        pad_w = target_shape[1] - tensor.shape[2]
+        # Padding format in PyTorch: (left, right, top, bottom)
+        # padded_tensor = torch.nn.functional.pad(tensor, (math.ceil(pad_w/2), pad_w - math.ceil(pad_w/2),math.ceil(pad_h/2), pad_h - math.ceil(pad_h/2)), mode='constant', value=0)
+        padded_tensor = torch.nn.functional.pad(tensor, (0, pad_w, 0, pad_h), mode='constant', value=0)
+        return padded_tensor
+    
+    def convolve(self,prob_1, prob_2):
+        padded_length = (2*self.grid_size[0] - 1,2*self.grid_size[1] - 1)
+        prob_1 = self.pad_for_fft_2d(prob_1, padded_length)
+        prob_2 = self.pad_for_fft_2d(prob_2, padded_length)
+        moments_1 = torch.fft.fft2(prob_1)
+        moments_2 = torch.fft.fft2(prob_2)
+        moments_convolve = moments_1 * moments_2
+        unnorm_density_convolve = torch.fft.ifft2(moments_convolve)
+        unnorm_density_convolve_final = unnorm_density_convolve[:,math.floor(self.grid_size[0]/2):math.floor(self.grid_size[0]/2) + self.grid_size[0] ,math.floor(self.grid_size[1]/2):math.floor(self.grid_size[1]/2) + self.grid_size[1]].real
+        unnorm_density_convolve_final = torch.clamp(unnorm_density_convolve_final,min=1e-10)
+        z_3 = self.normalization_constant(unnorm_density_convolve_final)
+        density_convolve = unnorm_density_convolve_final/z_3
+        return density_convolve
+
+    def mode(self,predicted_density, ground_truth=None):
+
+        #TODO: Implement the mode function for multimodal to give top n_modes max values
+
+        max_vals_row, max_x = torch.max(predicted_density, dim=2)  # max over columns, shape (10, 50)
+
+        # Step 2: Get the maximum values and their column indices along the second-to-last dimension (dim=1)
+        _, max_y = torch.max(max_vals_row, dim=1)  # max over rows, shape (10,)
+
+        # Step 3: Gather the x indices corresponding to the max y indices
+        max_x = max_x[torch.arange(max_x.size(0)), max_y]  # shape (10,)
+
+        # Step 4: Stack the coordinates to get the final shape (10, 2)
+        mode_idx = torch.stack((max_x, max_y), dim=1) 
+
+        if self.range_x is None and self.range_y is None:
+            min_x = - self.range_x_diff/2 + ground_truth[:,0]
+            min_y = - self.range_x_diff/2 + ground_truth[:,1]
+        else:
+            min_x = self.range_x[0]
+            min_y = self.range_y[0]
+    
+        poses_mode_x = mode_idx[:, 0] * self.step_t[0] + min_x
+        poses_mode_y = mode_idx[:, 1] * self.step_t[1] + min_y
+        poses_mode = torch.stack((poses_mode_x, poses_mode_y), dim=-1)
+
+        return poses_mode
+
+
+    # def product(self, other_distribution):
+    #     return self.pdf() * other_distribution.pdf()
+
+    # def pdf(self):
+    #     return norm.pdf(self.x_grid, loc=self.mean, scale=self.bandwidth) * \
+    #            norm.pdf(self.y_grid, loc=self.mean, scale=self.bandwidth)
+

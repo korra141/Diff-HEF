@@ -6,6 +6,36 @@ import ot  # Install with: pip install POT
 
 from geomloss import SamplesLoss
 
+def mse(p, q):
+    """
+    Calculate the Mean Squared Error (MSE) between two tensors p and q.
+    Both p and q should be torch tensors of the same shape.
+    p : torch.Tensor [batch_size, 3]
+    q : torch.Tensor [batch_size, 3]
+    """
+    assert p.shape == q.shape, "Input tensors must have the same shape"
+    # Calculate the absolute error
+    dtheta = absolute_error_s1(p[:,2], q[:,2])
+    dx = p[:, 0] - q[:, 0]
+    dy = p[:, 1] - q[:, 1]
+
+    return torch.mean(dx ** 2 + dy**2 + dtheta**2)
+
+def mse_trajectory(p, q):
+    """
+    Calculate the Mean Squared Error (MSE) between two tensors p and q.
+    Both p and q should be torch tensors of the same shape.
+    p : torch.Tensor [batch_size, 3]
+    q : torch.Tensor [batch_size, 3]
+    """
+    assert p.shape == q.shape, "Input tensors must have the same shape"
+    # Calculate the absolute error
+    dtheta = absolute_error_s1(p[:, :, 2], q[:,:,2])
+    dx = p[:, :, 0] - q[:, :, 0]
+    dy = p[:, :, 1] - q[:,:, 1]
+
+    return torch.mean(dx ** 2 + dy**2 + dtheta**2)
+
 def fast_wasserstein_geomloss(p, q):
     """
     Computes Wasserstein distance using GeomLoss for fast Sinkhorn approximation.
@@ -269,9 +299,13 @@ def compute_weighted_mean(prob: torch.Tensor,
     Compute weighted mean of a distribution
     :return mean of distribution
     """
+    # theta = (theta + math.pi) % (2 * math.pi) - math.pi
+    poses_ = poses.clone()
+    # poses_[:,:,2] = (poses[:,:,2] + math.pi) % (2 * math.pi) - math.pi
+    
     # Compute mean
     prob = prob.reshape(prob.shape[0], -1)
-    prod = poses * prob[..., None]
+    prod = poses_ * prob[..., None]
     prod = prod.view(-1, x.size(0), x.size(1), x.size(2), 3)
     
     # Integrate x, y, theta
@@ -346,7 +380,7 @@ def rmse_se2(gt_trajectory_, trajectory_, scaling_factor=1.0, offset_x=0.0, offs
     # Scale the gt trajectory
     gt_trajectory[0, :, :] = (gt_trajectory[0, :, :] / scaling_factor) - offset_x
     gt_trajectory[1, :, :] = (gt_trajectory[1, :, :] / scaling_factor) - offset_y
-    zeros = torch.zeros((1, gt_trajectory.shape[1], gt_trajectory.shape[2]), dtype=torch.float32).to(gt_trajectory.device)
+    zeros = torch.zeros((1, gt_trajectory.shape[1], gt_trajectory.shape[2]), dtype=torch.float64).to(gt_trajectory.device)
 
     # Append zeros in third dimension as z coordinate
     gt_trajectory = torch.vstack((gt_trajectory, zeros))
@@ -358,19 +392,19 @@ def rmse_se2(gt_trajectory_, trajectory_, scaling_factor=1.0, offset_x=0.0, offs
 
     # Align trajectory
     rot, trans, trans_error = align(trajectory, gt_trajectory)
-    rot = rot.to(torch.float32)
-    trans = trans.to(dtype=torch.float32)
+    rot = rot.to(torch.float64)
+    trans = trans.to(dtype=torch.float64)
 
     aligned_trajectory = torch.bmm(rot.permute(2, 0, 1), trajectory.permute(2, 0, 1)).permute(1, 2, 0) + trans  # (3, n, batch_size)
 
     # Compute metrics
-    trans_error = trans_error.to(torch.float32)
+    trans_error = trans_error.to(torch.float64)
     # metrics = torch.sqrt(torch.dot(trans_error, trans_error) / len(trans_error))
 
     # Assuming trans_error is of shape (1, 5, 10)
     trajectory_length = trans_error.shape[1]  # Infer the trajectory length dynamically
 
-    trans_error_squared = trans_error ** 2  # Square the error (shape will be (1, 5, 10))
+    trans_error_squared = trans_error * trans_error  # Square the error (shape will be (1, 5, 10))
 
     # Sum along the trajectory dimension (axis=1) and then take the mean
     squared_error_sum = trans_error_squared.sum(dim=1)  # (1, 10) -- summed across trajectory length
@@ -379,7 +413,7 @@ def rmse_se2(gt_trajectory_, trajectory_, scaling_factor=1.0, offset_x=0.0, offs
     # Take the square root to get the final metric (1, 10) shape
     metrics = torch.sqrt(mean_squared_error).transpose(1,0)  # (1, 10) -- metric for each batch
 
-    return torch.mean(metrics)
+    return float(torch.mean(metrics).item())
 
 def kl_divergence( p, q):
 

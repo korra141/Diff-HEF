@@ -306,7 +306,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Diff-HEF SE2 Range Simulator")
     parser.add_argument('--num_epochs', type=int, default=10, help='Number of epochs')
     parser.add_argument('--num_trajectories', type=int, default=500, help='Number of trajectories')
-    parser.add_argument('--trajectory_length', type=int, default=20, help='Length of each trajectory')
+    parser.add_argument('--trajectory_length', type=int, default=80, help='Length of each trajectory')
     parser.add_argument('--step_motion', type=float, nargs=3, default=[0.01, 0.00, np.pi / 40], help='Step motion parameters')
     parser.add_argument('--motion_cov', type=float, nargs=3, default=[0.1, 0.1, 0.04], help='Motion noise parameters')
     parser.add_argument('--measurement_cov', type=float, default=0.5, help='Measurement noise')

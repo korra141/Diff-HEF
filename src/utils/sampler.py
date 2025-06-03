@@ -22,9 +22,9 @@ def se2_grid_samples_torch(
             - Y: Meshgrid tensor for the y dimension.
             - T: Meshgrid tensor for the theta dimension.
     """
-    xs = torch.linspace(lower_bound, upper_bound, size[0]+1)[:-1]
-    ys = torch.linspace(lower_bound, upper_bound, size[1]+1)[:-1]
-    ts = torch.linspace(-torch.pi, torch.pi, size[2]+1)[:-1]
+    xs = torch.linspace(lower_bound, upper_bound, size[0]+1, dtype=torch.float64)[:-1]
+    ys = torch.linspace(lower_bound, upper_bound, size[1]+1, dtype=torch.float64)[:-1]
+    ts = torch.linspace(0, 2*torch.pi, size[2]+1, dtype=torch.float64)[:-1]
     
 
     X, Y, T = torch.meshgrid(xs, ys, ts, indexing='ij')

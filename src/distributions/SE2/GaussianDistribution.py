@@ -115,6 +115,7 @@ class GaussianSE2:
         """
         # Compute difference from the mean
         diff = x - self.mu.unsqueeze(1)
+        # diff = x - self.mu
 
         # Wrap the angular difference to [-pi, pi]
         diff[:, :, 2] = (diff[:,:, 2] + torch.pi) % (2*torch.pi) - torch.pi

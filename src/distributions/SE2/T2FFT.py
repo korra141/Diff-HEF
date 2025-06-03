@@ -53,7 +53,7 @@ class T2FFT():
         # Shift zero frequency component to the center
         f_hat = torch.fft.fftshift(f_hat, dim=axes)
         # Normalize
-        size = torch.prod(torch.tensor([f.shape[ax] for ax in axes], dtype=torch.float32))
+        size = torch.prod(torch.tensor([f.shape[ax] for ax in axes], dtype=torch.float64))
         return f_hat  / size
 
     @staticmethod
@@ -64,7 +64,7 @@ class T2FFT():
         :return: Reconstructed function.
         """
         # Compute the size of the input
-        size = torch.prod(torch.tensor([f_hat.shape[ax] for ax in axes], dtype=torch.float32))
+        size = torch.prod(torch.tensor([f_hat.shape[ax] for ax in axes], dtype=torch.float64))
         # Shift zero frequency component back to original position
         f_hat = torch.fft.ifftshift(f_hat * size, dim=axes)
 #         f_hat = torch.fft.ifftshift(f_hat, dim=axes)

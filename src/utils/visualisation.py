@@ -329,21 +329,22 @@ def plot_se2_filters(filters: dict[str, list[np.ndarray]],
     cfg = deepcopy(config)
     # Each axis correspond to a different filter
     fig = plt.figure(constrained_layout=True, figsize=(9, 9))
-    # gs = fig.add_gridspec(3, 3)
-    # ax1 = fig.add_subplot(gs[0, 0])
-    # ax2 = fig.add_subplot(gs[0, 1])
-    # ax3 = fig.add_subplot(gs[1, 0])
-    # ax4 = fig.add_subplot(gs[1, 1])
-    # ax5 = fig.add_subplot(gs[0, 2])
-    # ax6 = fig.add_subplot(gs[1, 2])
-    # ax7 = fig.add_subplot(gs[2, 0])
-    gs = fig.add_gridspec(2, 2)
+    gs = fig.add_gridspec(3, 3)
     ax1 = fig.add_subplot(gs[0, 0])
     ax2 = fig.add_subplot(gs[0, 1])
     ax3 = fig.add_subplot(gs[1, 0])
     ax4 = fig.add_subplot(gs[1, 1])
+    ax5 = fig.add_subplot(gs[0, 2])
+    ax6 = fig.add_subplot(gs[1, 2])
+    ax7 = fig.add_subplot(gs[2, 0])
+    ax8 = fig.add_subplot(gs[2, 1])
+    # gs = fig.add_gridspec(2, 2)
+    # ax1 = fig.add_subplot(gs[0, 0])
+    # ax2 = fig.add_subplot(gs[0, 1])
+    # ax3 = fig.add_subplot(gs[1, 0])
+    # ax4 = fig.add_subplot(gs[1, 1])
     # ax4 = fig.add_subplot(gs[:, 1:])
-    axes = [ax1, ax2, ax3, ax4]
+    axes = [ax1, ax2, ax3, ax4, ax5, ax6, ax7,ax8]
     
     # axes = [ax1, ax2, ax3, ax4, ax5, ax6, ax7]
 
@@ -374,14 +375,14 @@ def plot_se2_filters(filters: dict[str, list[np.ndarray]],
     ax1.pcolormesh(x, y, scaled_posterior, shading='auto', cmap=cmap, zorder=0, vmin=0, vmax=1.0)
 
     ### Plot Diff EKF ###
-    # for c in cfg:
-    #     if c.get('label') == 'Diff-EKF':
-    #         break
-    # c.pop('label')
-    # c['edgecolor'] = c.pop('markeredgecolor')
-    # diff_ekf = filters['Diff-EKF']
-    # c["label"] = "Mean"
-    # plot_confidence_ellipse(diff_ekf[0][:2], diff_ekf[1][0:2, 0:2], ax5, **c)
+    for c in cfg:
+        if c.get('label') == 'Diff-EKF':
+            break
+    c.pop('label')
+    c['edgecolor'] = c.pop('markeredgecolor')
+    diff_ekf = filters['Diff-EKF']
+    c["label"] = "Mean"
+    plot_confidence_ellipse(diff_ekf[0][:2], diff_ekf[1][0:2, 0:2], ax5, **c)
 
     ### Plot EKF ###
     for c in cfg:
@@ -394,14 +395,14 @@ def plot_se2_filters(filters: dict[str, list[np.ndarray]],
     plot_confidence_ellipse(ekf[0][:2], ekf[1][0:2, 0:2], ax2, **c)
 
     ### PLot LSTM ###
-    # for c in cfg:
-    #   if c.get('label') == 'LSTM':
-    #       break
-    # c.pop('label')
-    # c['edgecolor'] = c.pop('markeredgecolor')
-    # lstm = filters['LSTM']
-    # c["label"] = "Mean"
-    # plot_confidence_ellipse(lstm[0][:2], lstm[1][0:2, 0:2], ax7, **c)
+    for c in cfg:
+      if c.get('label') == 'LSTM':
+          break
+    c.pop('label')
+    c['edgecolor'] = c.pop('markeredgecolor')
+    lstm = filters['LSTM']
+    c["label"] = "Mean"
+    plot_confidence_ellipse(lstm[0][:2], lstm[1][0:2, 0:2], ax7, **c)
 
     ### Plot PF ###
     for c in cfg:
@@ -423,6 +424,28 @@ def plot_se2_filters(filters: dict[str, list[np.ndarray]],
     # ax3.scatter(pf[2][0], pf[2][1], **c)
     ax4.scatter(pf[1][idx, 0], pf[1][idx, 1], c=c['c'], s=30, alpha=0.2, marker=c['marker'], zorder=0)
 
+
+    #     ### Plot Diff PF ###
+    for c in cfg:
+        if c.get('label') == 'Diff-PF':
+            break
+    c.pop('label')
+    c['label'] =  "Mean"
+    diff_pf = filters['Diff-PF']
+    c['edgecolor'] = c.pop('markeredgecolor')
+    # Select randomly a percentage of particles to plot
+    percentage = 0.125 / 2
+    n_particles = diff_pf[1].shape[0]
+    n_particles_to_plot = int(n_particles * percentage)
+    idx = np.random.choice(n_particles, n_particles_to_plot, replace=False)
+    ax4.scatter(diff_pf[0][0], diff_pf[0][1], **c)
+    # c["label"] = "Mode"
+    # c["edgecolor"] = "honeydew"
+    # c["linewidth"] = 1.5
+    # ax3.scatter(pf[2][0], pf[2][1], **c)
+    ax4.scatter(diff_pf[1][idx, 0], diff_pf[1][idx, 1], c=c['c'], s=30, alpha=0.2, marker=c['marker'], zorder=0)
+
+
     # ### Plot HF ###
     for c in cfg:
         if c.get('label') == 'HistF':
@@ -443,23 +466,23 @@ def plot_se2_filters(filters: dict[str, list[np.ndarray]],
     ax3.pcolormesh(x, y, hf_posterior, shading='auto', cmap=cmap, zorder=0, vmin=0, vmax=1.0)
 
     ### Plot Diff-Hist ###
-    # for c in cfg:
-    #     if c.get('label') == 'Diff-HistF':
-    #         break
-    # c.pop('label')
-    # cmap = c.pop('cmap')
-    # c["label"] = "Mean"
-    # c['edgecolor'] = c.pop('markeredgecolor')
-    # diff_hf = filters['Diff-HistF']
-    # ax6.scatter(diff_hf[0][0], diff_hf[0][1], **c)
-    # # c["label"] = "Mode"
-    # # c["edgecolor"] = "honeydew"
-    # # c["linewidth"] = 1.5
-    # # ax4.scatter(hf[2][0], hf[2][1], **c)
-    # diff_hf_posterior = diff_hf[1].sum(-1)
-    # max_value, min_value = diff_hf_posterior.max(), diff_hf_posterior.min()
-    # diff_hf_posterior = (diff_hf_posterior - min_value) / (max_value - min_value)
-    # ax6.pcolormesh(x, y, diff_hf_posterior, shading='auto', cmap=cmap, zorder=0, vmin=0, vmax=1.0)
+    for c in cfg:
+        if c.get('label') == 'Diff-HistF':
+            break
+    c.pop('label')
+    cmap = c.pop('cmap')
+    c["label"] = "Mean"
+    c['edgecolor'] = c.pop('markeredgecolor')
+    diff_hf = filters['Diff-HistF']
+    ax6.scatter(diff_hf[0][0], diff_hf[0][1], **c)
+    # c["label"] = "Mode"
+    # c["edgecolor"] = "honeydew"
+    # c["linewidth"] = 1.5
+    # ax4.scatter(hf[2][0], hf[2][1], **c)
+    diff_hf_posterior = diff_hf[1].sum(-1)
+    max_value, min_value = diff_hf_posterior.max(), diff_hf_posterior.min()
+    diff_hf_posterior = (diff_hf_posterior - min_value) / (max_value - min_value)
+    ax6.pcolormesh(x, y, diff_hf_posterior, shading='auto', cmap=cmap, zorder=0, vmin=0, vmax=1.0)
 
     ### Plot beacons and ground truth ###
     for c in cfg:

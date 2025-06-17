@@ -62,8 +62,8 @@ def loss_fn(predicted_state, cov,  true_state):
     # nll = 0.5 * (diff ** 2 / predicted_covariance) + 0.5 * torch.log(2 * math.pi * predicted_covariance)
 
     nll = 0.5 * torch.sum((diff ** 2) / (sigma ** 2) + torch.log(sigma ** 2) + torch.log(torch.tensor(2) * torch.pi), dim=2)
-    # return 0.5* (torch.mean(nll) + mse_trajectory(predicted_state,true_state))
-    return torch.mean(nll)
+    return 0.5* (torch.mean(nll) + mse_trajectory(predicted_state,true_state))
+    # return torch.mean(nll)
 
 def train_lstm_se2(args, logging_path):
     # Generate dataset
@@ -158,7 +158,7 @@ def test_lstm_se2(args, logging_path, model_path):
         with torch.no_grad():
             predicted_states, cov = lstm_filter(control.to(torch.float32), measurements.to(torch.float32), initial_state, cov_prior_batch)
             nll_lstm +=loss_fn(predicted_states, cov, inputs)
-            total_rmse += rmse_se2(inputs, predicted_states[:, 1:, :])
+            total_rmse += rmse_se2(inputs, predicted_states)
 
     print(f"Test RMSE: {total_rmse / len(test_loader)}")
     print(f"Test NLL: {nll_lstm / len(test_loader)}")
@@ -172,22 +172,23 @@ def parse_args():
     parser.add_argument('--motion_cov', type=float, nargs=3, default=[0.001, 0.001, 0.001], help='Motion noise parameters')
     parser.add_argument('--measurement_cov', type=float, default=0.0001, help='Measurement noise')
     parser.add_argument('--batch_size', type=int, default=30, help='Batch size')
-    parser.add_argument('--validation_split', type=float, default=0.1, help='Validation split')
+    parser.add_argument('--validation_split', type=float, default=0.12, help='Validation split')
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
     parser.add_argument('--save_interval', type=int, default=50, help='Save interval for model checkpoints')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use')
     parser.add_argument('--cov_prior', type=float, nargs=3, default=[0.1, 0.1, 0.1], help='Prior covariance for state estimation')
     parser.add_argument('--grid_size',  type=float, nargs=3, default=[50, 50, 32],  help='Grid size for SE2 sampling')
+    parser.add_argument('--seed', type=int, default=12345, help='Random seed for reproducibility')
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     if args.device == 'cuda':
-        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed_all(args.seed)
 
     current_datetime = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     logging_path = os.path.join(base_path, "logs", "LSTM_SE2", current_datetime)

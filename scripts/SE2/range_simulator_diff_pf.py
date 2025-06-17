@@ -1,7 +1,9 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
+from torch.distributions import Normal
 import os
 import sys
 import math
@@ -17,20 +19,13 @@ sys.path.append(base_path)
 pid = os.getpid()
 
 torch.cuda.empty_cache()
-from src.distributions.SE2.GaussianDistribution import GaussianSE2 as GaussianDistribution_se2
-from src.distributions.R1.HarmonicExponentialDistribution import HarmonicExponentialDistribution as R1_HED
-from src.distributions.SE2.SE2_torch import SE2_FFT
 from src.utils.sampler import se2_grid_samples_torch
-from src.filter.HEF_SE2 import HEFilter
 from src.distributions.SE2.se2_distribution import SE2, SE2Gaussian
 from src.filter.bayes_filter import BayesFilter
-from src.filter.EKF import RangeEKF
-from src.filter.HistF import BatchedRangeHF
-from src.filter.PF import RangePF
 from src.filter.Diff_PF import DifferentiablePF
 from src.data_generation.SE2.range_simulator import generate_bounded_se2_dataset
 from src.data_generation.SE2.range_simulator import SE2Group
-from src.utils.metrics import rmse_se2, compute_weighted_mean
+from src.utils.metrics import rmse_se2, compute_weighted_mean, mse
 from src.utils.visualisation import plot_se2_mean_filters,plot_se2_filters
 import argparse
 from torch.utils.data import Dataset
@@ -93,8 +88,8 @@ def range_pf_step(inputs, measurements, control, landmarks, pf_filter, MOTION_NO
     # measurement_cov_ = torch.tile(measurement_cov.unsqueeze(0), [inputs.shape[0], 1, 1])
     belief_hat = pf_filter.prediction(control, motion_model_cov_)
 
-    landmarks = landmarks.to(self.device)
-    measurements = measurements.to(self.device)
+    landmarks = landmarks.to(device)
+    measurements = measurements.to(device)
     # observations_cov = observations_cov.to(self.device)
     
     # Ensure proper batch dimension for landmarks
@@ -107,6 +102,7 @@ def range_pf_step(inputs, measurements, control, landmarks, pf_filter, MOTION_NO
     
     # For each batch and landmark, compute distances between particles and landmark
     num_landmarks = landmarks.shape[1]
+    # print(num_landmarks)
     
     for i in range(num_landmarks):
         # Current landmark for all batches: (B, 1, 2)
@@ -126,21 +122,19 @@ def range_pf_step(inputs, measurements, control, landmarks, pf_filter, MOTION_NO
         
         # Compute log probabilities: (B, N)
         # Using broadcasting to handle batched computation
-        log_prob = Normal(distance, std_i).log_prob(obs_i.unsqueeze(1))
+        log_prob = Normal(obs_i.unsqueeze(1), std_i).log_prob(distance)
         
         # Update weights: (B, N)
         log_weights += log_prob
     
     posterior_mean = pf_filter.update(log_weights)
-    nll_posterior = pf_filter.neg_log_likelihood(inputs )
+    nll_posterior = pf_filter.neg_log_likelihood(inputs)
     return posterior_mean, pf_filter.particles , nll_posterior
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
 
 class MeasurementDistributionNet(nn.Module):
-    def __init__(self, input_dim=3, hidden_dim=128, num_particles=50):
+    def __init__(self, input_dim=4, hidden_dim=512, num_particles=50):
         super(MeasurementDistributionNet, self).__init__()
         
         self.input_dim = input_dim  # Particle belief state has 3 features
@@ -149,10 +143,18 @@ class MeasurementDistributionNet(nn.Module):
         
         # Define layers
         self.fc1 = nn.Linear(self.num_particles * self.input_dim, self.hidden_dim)
+        # self.fc2 = nn.Linear(self.num_particles * self.input_dim, self.hidden_dim)
         self.fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.fc3 = nn.Linear(self.hidden_dim, self.num_particles)
+        self.fc4 = nn.Linear(self.hidden_dim, self.num_particles)
+
+
+        self.conv1 = nn.Conv3d(in_channels=2, out_channels=4, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv3d(in_channels=4, out_channels=4, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv3d(in_channels=4, out_channels=1, kernel_size=3, stride=1, padding=1)
         
-    def forward(self, particles):
+        self.relu = nn.ReLU()
+    def forward(self, particles, observation):
         """
         Forward pass for the particles.
         particles: tensor of shape [B, N, 3] where B is batch size, N is number of particles.
@@ -160,40 +162,85 @@ class MeasurementDistributionNet(nn.Module):
         Returns:
         measurement_distribution: tensor of shape [B, N], the measurement distribution for each particle.
         """
+        # pdb.set_trace()
         # Reshape particles to [B * N, 3] for batch processing
         B, N, _ = particles.shape
-        particles_flat = particles.reshape(-1,  self.num_particles * self.input_dim)
-        
+        # particles_flat = particles.reshape(-1, self.num_particles * self.input_dim) # [B, 1, N*3]
+        assert observation.shape == (B, 1), "Observation should have shape [B, 1]"
+        z = observation.unsqueeze(1)  # Shape [batch_size, 1, 1]
+        z = z.expand(-1, self.num_particles, -1)  # Now z has shape [batch_size, N, 1]
+        #p_x_padded = self.input_padding(p_x.unsqueeze(1))
+        # Concatenate p_x and z along the channel dimension (axis 1)
+        input_ = torch.cat([particles, z], dim=-1)  # Shape [batch_size, N, 4]
+
+        input_flat = input_.reshape(B, -1)  # Flatten to [B, N * 4]
+         
         # Pass through the network
-        x = F.relu(self.fc1(particles_flat))  # Apply ReLU after first layer
-        x = F.relu(self.fc2(x))               # Apply ReLU after second layer
-        measurement_distribution = self.fc3(x)  # Output layer
-        
+        x_1 = self.relu(self.fc1(input_flat))  # Apply ReLU after first layer
+        x_2 = self.relu(self.fc2(x_1))      # Apply ReLU after second layer
+        # x_3 = self.relu(self.fc3(x_2))      # Apply ReLU after third layer
+
+        # x_1 = self.relu(self.conv1(input_))  # Apply ReLU after first layer
+        # x_2 = self.relu(self.conv2(x_1))      # Apply ReLU after second layer
+        # x_3 = self.relu(self.conv3(x_2))      # Apply ReLU after third layer
+
+        pred_observations = self.fc3(x_2)  # Output layer
         # Reshape back to [B, N]
-        measurement_distribution = measurement_distribution.reshape(-1, N)
+        pred_observations = pred_observations.reshape(-1, N, 1)
+
+        observations_var = self.fc4(x_2)  # Output layer for variance
+
+        observations_var = observations_var.reshape(-1, N, 1)
+
+        observations_cov = observations_var ** 2  # Variance
+        observations_cov = observations_cov.unsqueeze(-1)
+        # observations_cov = torch.diag_embed(observations_var, dim1=-1)  # Create diagonal covariance matrix
+
+        # Compute log likelihoods
+        log_likelihoods = torch.distributions.MultivariateNormal(
+            loc=pred_observations, scale_tril=observations_cov
+        ).log_prob(z)
+
+        # Reshape and return
+        return log_likelihoods
         
-        return measurement_distribution
+        # return measurement_pdf
 
 
-def train_range_pf_step(poses, range_beacon, model, inputs, measurements, control, pf_filter, MOTION_NOISE):
+def train_range_pf_step(prior, log_weights, poses, range_beacon, model, inputs, measurements, control, pf_filter, MOTION_NOISE):
 
     with torch.no_grad():
         motion_model_cov = torch.diag(torch.tensor(MOTION_NOISE ** 2)).to(torch.float64).to(device)
         motion_model_cov_ = torch.tile(motion_model_cov.unsqueeze(0), [inputs.shape[0], 1, 1])
-        belief_hat = pf_filter.prediction(control, motion_model_cov_) #[B, N, 3]
-
-    measurement_energy = model(belief_hat.to(torch.float32)) #[B, N]
-    pf_filter.update_weights(measurement_energy)
-    pf_filter.differentiable_resampling()
+        # start_time_prediction = datetime.datetime.now()
+        belief_hat = pf_filter.prediction(prior, control, motion_model_cov_) #[B, N, 3]
+        # print(f"Time taken for prediction: {datetime.datetime.now() - start_time_prediction}")
+    
+    # start_time_forward = datetime.datetime.now()
+    measurement_log_likelihood = model(belief_hat.to(torch.float32), measurements.to(torch.float32)) #[B, N]
+    # print(f"Time taken for forward pass: {datetime.datetime.now() - start_time_forward}")
+    # start_time_weights = datetime.datetime.now()
+    updated_log_weights = pf_filter.update_weights(log_weights, measurement_log_likelihood)
+    # print(f"Time taken for weight update: {datetime.datetime.now() - start_time_weights}")
+    # updated_particles, updated_weights = pf_filter.differentiable_resample_windowed(belief_hat, updated_weights)
+    # pdb.set_trace()
+    updated_particles_resampled, updated_log_weights_resampled = pf_filter._resample(belief_hat, updated_log_weights)
+    # updated_particles_resampled = belief_hat 
+    # updated_log_weights_resampled = updated_log_weights
     # pf_filter.lightweight_soft_resampling()
-    posterior_mean = pf_filter.get_state_estimate()
-    weights = torch.exp(pf_filter.log_weights)
-    diff = pf_filter.particles - inputs.unsqueeze(1)
-    nll_posterior = pf_filter.mixture_likelihood(diff, weights, reduce_mean=True)
+    # start_time_mean = datetime.datetime.now()
+    posterior_mean = pf_filter.get_state_estimate(updated_particles_resampled, updated_log_weights_resampled)
+    # print(f"Time taken for posterior mean calculation: {datetime.datetime.now() - start_time_mean}")
+    diff = updated_particles_resampled - inputs.unsqueeze(1)
+    # pdb.set_trace()
+    # start_time_posterior = datetime.datetime.now()
+    nll_posterior = pf_filter.mixture_likelihood(diff,  updated_log_weights_resampled, reduce_mean=True)
+    # print(f"Time taken for posterior NLL calculation: {datetime.datetime.now() - start_time_posterior}")
+    # start_time_measurement = datetime.datetime.now()
+    # nll_measurement = pf_filter.neg_log_likelihood_measurement(poses, range_beacon, measurements, updated_weights)
+    # print(f"Time taken for measurement NLL calculation: {datetime.datetime.now() - start_time_measurement}")
 
-    # nll_measurement = pf_filter.neg_log_likelihood_measurement(poses, range_beacon, measurements, weights)
-
-    return posterior_mean, pf_filter.particles, nll_posterior
+    return posterior_mean, updated_particles_resampled, updated_log_weights_resampled, nll_posterior
 
 
 
@@ -291,11 +338,12 @@ def main(args, logging_path):
         test_split=args.test_split
     )
     # model = DensityEstimator(math.prod(grid_size)).to(device)
-    model = MeasurementDistributionNet(input_dim=3, hidden_dim=1024, num_particles=math.prod(grid_size)).to(device)
+    model = MeasurementDistributionNet(input_dim=4, hidden_dim=1024, num_particles=math.prod(grid_size)).to(device)
     model.apply(initialize_weights)
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate_start)
-    lr_decay = lambda epoch : (args.learning_rate_end / args.learning_rate_start) ** ((epoch / NUM_EPOCHS) * args.slope_weight)
+    lr_decay = lambda epoch : (args.learning_rate_end / args.learning_rate_start) ** ((epoch / NUM_EPOCHS) ** args.slope_weight)
     torch.autograd.set_detect_anomaly(True)
+    diff_pf_filter = DifferentiablePF(math.prod(grid_size), batch_size, grid_size, device=device, soft_resample_alpha=args.soft_resample_alpha)
     for epoch in range(NUM_EPOCHS):
         loss_tot = 0
         mean_rmse_tot = 0
@@ -315,20 +363,34 @@ def main(args, logging_path):
             start_time_step = datetime.datetime.now()
             inputs, measurements, control, beacon_id = data
             inputs, measurements, control, beacon_id = inputs.to(device), measurements.to(device), control.to(device), beacon_id.to(device)
-            diff_pf_filter = DifferentiablePF(inputs[:, 0], cov_prior_batch, poses.shape[1], batch_size, grid_size, device=device)
+            # Generate particles from prior: (B, N, 3)
+            L = torch.linalg.cholesky(cov_prior_batch)  # (B, 3, 3)
+            noise = torch.randn((batch_size, 3, math.prod(grid_size)), device=device, dtype=torch.float64)  # (B, 3, N)
+            # L @ noise -> (B, 3, N), then transpose and add prior
+            particles_noise = torch.bmm(L, noise)  # (B, 3, N)
+            prior_pf = particles_noise.permute(0, 2, 1) + inputs[:, 0].unsqueeze(1)  # (B, N, 3)
+            
+            log_weight_pf = torch.ones((batch_size, math.prod(grid_size)), device=device, dtype=torch.float64) * (-np.log(math.prod(grid_size)))  # (B, N)
             trajectory_list = []
+            trajectory_list.append(inputs[:, 0])  # Append the initial pose
             sample_idx = random.randint(0, batch_size - 1)
             # Perform operations on inputs and labels using HEF analytical filter here
             for i in range(TRAJECTORY_LENGTH - 1):
                 traj_idx = i + 1
                 start_time_step = datetime.datetime.now()
 
+                
                 range_beacon = beacons[beacon_id[:, i], :]
 
-                posterior_mean_pf, posterior_pf, nll_posterior_pf = train_range_pf_step(poses, range_beacon, model, inputs[:, traj_idx], measurements[:, i], control[:, i], diff_pf_filter, MOTION_NOISE=MOTION_NOISE)
-
+                # start_time_step = datetime.datetime.now()
+                posterior_mean_pf, posterior_pf, updated_log_weights, nll_posterior_pf = train_range_pf_step(prior_pf,  log_weight_pf, poses, range_beacon, model, inputs[:, traj_idx], measurements[:, i], control[:, i], diff_pf_filter, MOTION_NOISE=MOTION_NOISE)
+                # print(f"Time taken for differentiable PF step: {datetime.datetime.now() - start_time_step}")
+                log_weight_pf = updated_log_weights.detach()
+                prior_pf = posterior_pf.detach()
+                # pdb.set_trace()
                 # if epoch < args.threshold_warmup:
-                loss = nll_posterior_pf.to(torch.float32)
+                # loss = nll_posterior_pf.to(torch.float32)
+                loss = 0.5*(nll_posterior_pf.to(torch.float32) + mse(posterior_mean_pf, inputs[:, traj_idx]).to(torch.float32))
                 # else:
                 #     loss = (regularizer_weight * nll_measurement_pf + (1 - regularizer_weight) * nll_posterior_pf).to(torch.float32)
                 # loss = (regularizer_weight * nll_measurement_likelihood + (1-regularizer_weight) * nll_posterior).to(torch.float32)
@@ -341,6 +403,9 @@ def main(args, logging_path):
                     loss_tot += float(loss.item())
                     # nll_likelihood_tot += float(nll_measurement_pf.item())
                     nll_posterior_tot += float(nll_posterior_pf.item())
+
+                # print(f"Processing Epoch {epoch + 1}/{NUM_EPOCHS}, Batch {j + 1}/{len(train_loader)}, Step {i + 1}/{TRAJECTORY_LENGTH - 1}, Time: {datetime.datetime.now() - start_time_step}")
+
                 # Visualise ther results 
             predicted_trajectory = torch.stack(trajectory_list, dim=1)
 
@@ -383,312 +448,6 @@ def main(args, logging_path):
             wandb.save(model_save_path, base_path=logging_path)
 
 
-def inference(args, logging_path,  diff_model_path=None):
-    
-    if diff_model_path and os.path.exists(diff_model_path):
-        model = DensityEstimator(args.grid_size).to(device)
-        model.load_state_dict(torch.load(diff_model_path))
-        model.eval()
-    else:
-        print("Diff_HEF Model path is not provided or does not exist.")
-
-    range_x = (-0.5, 0.5)
-    range_y = (-0.5, 0.5)
-    fft = SE2_FFT(spatial_grid_size=args.grid_size,
-                       interpolation_method='spline',
-                       spline_order=1,
-                       oversampling_factor=1, 
-                       device=device)
-    TRUE_MEASUREMENT_NOISE = np.sqrt(args.measurement_cov).item()
-    ESTIMATED_MEASUREMENT_NOISE = np.sqrt(args.measurement_cov).item()
-    MOTION_NOISE = np.sqrt(np.array(args.motion_cov))
-
-    hed_r1 = R1_HED(math.prod(args.grid_size), torch.sqrt(torch.tensor(2)))
-
-    poses, X, Y, T = se2_grid_samples_torch(args.batch_size, args.grid_size)
-    poses, X, Y, T = poses.to(device), X.to(device), Y.to(device), T.to(device)
-    
-    legend = [ rf"Predicted belief", rf"Measurement", rf"Posterior"]
-    CONFIG_MEAN_SE2_LF = [
-    # {'label': 'Diff-HEF', 'c': '#2ca02c', 'marker': 'X', 's': 120, 'markeredgecolor': 'k', 'lw': 1, 'zorder': 3,
-    #  'alpha': 0.8},
-    {'label': 'HEF', 'c': '#2ca02c', 'marker': 'X', 's': 120, 'markeredgecolor': 'k', 'lw': 1, 'zorder': 3, 'cmap': plt.cm.Greens,
-     'alpha': 0.8},
-    # {'label': 'Estimated-HEF', 'c': '#9467bd', 'marker': '<', 's': 120, 'markeredgecolor': 'k', 'lw': 1, 'zorder': 3,
-    #  'alpha': 0.8},
-    {'label': 'EKF', 'c': '#d62728', 'marker': 'D', 's': 120, 'markeredgecolor': 'k', 'lw': 1, 'zorder': 3, 'cmap': plt.cm.Reds_r,
-     'alpha': 0.8},
-    {'label': 'PF', 'c': '#9467bd', 'marker': '<', 's': 120, 'markeredgecolor': 'k', 'lw': 1, 'zorder': 3, 'cmap': plt.cm.Purples_r,
-     'alpha': 0.8},
-    {'label': 'HistF', 'c': '#8c564b', 'marker': 'p', 's': 120, 'markeredgecolor': 'k', 'lw': 1, 'zorder': 3, 'cmap': plt.cm.pink_r,
-     'alpha': 0.8},
-    {'label': 'GT', 'c': '#e377c2', 'marker': '*', 's': 120, 'markeredgecolor': 'k', 'lw': 1,
-     'zorder': 4, 'alpha': 0.8},
-    {'label': 'Beacons', 'c': 'dimgrey', 'marker': 'o', 's': 120, 'markeredgecolor': 'k', 'lw': 1,
-     'zorder': 2, 'alpha': 0.8}]
-
-    _, _, test_loader = generate_bounded_se2_dataset(
-        num_trajectories=args.num_trajectories,
-        trajectory_length=args.trajectory_length,
-        step_motion=SE2Group(args.step_motion[0], args.step_motion[1], args.step_motion[2]),
-        motion_noise=np.sqrt(np.array(args.motion_cov)),
-        measurement_noise=np.sqrt(args.measurement_cov),
-        samples=poses.cpu().numpy(),
-        batch_size=args.batch_size,
-        validation_split=args.validation_split,
-        test_split = args.test_split,
-        start_pose = SE2Group(0.0, -0.15, 0)
-    )
-
-
-    beacons = torch.tensor(
-            [[0, 0.1],
-             [0, 0.05],
-             [0, 0.0],
-             [0, -0.05],
-             [0, -0.1]]).to(device)
-    cov_prior = torch.diag(torch.tensor(args.cov_prior, dtype=torch.float64)).to(device)
-    cov_prior_batch = torch.tile(cov_prior.unsqueeze(0), [args.batch_size, 1, 1])
-
-    with torch.no_grad():
-        total_rmse = 0
-        total_rmse_true = 0
-        total_rmse_estimated = 0
-        total_rmse_ekf = 0
-        total_rmse_hist = 0
-        total_rmse_pf = 0
-
-        total_nll_likelihood = 0
-        total_nll_posterior = 0
-        total_nll_likelihood_true = 0
-        total_nll_posterior_true = 0
-        total_nll_likelihood_estimated = 0
-        total_nll_posterior_estimated = 0
-        total_nll_posterior_ekf = 0
-        total_nll_posterior_hist = 0
-        total_nll_posterior_pf = 0
-
-        num_samples = 0
-        sample_batch = 0
-        for batch_idx, data in enumerate(test_loader):
-
-            inputs, measurements,  control, beacon_idx  = data
-            inputs, measurements,  control, beacon_idx = inputs.to(device), measurements.to(device), control.to(device), beacon_idx.to(device)
-            
-            prior = SE2Gaussian(inputs[:, 0], cov_prior, samples=poses, fft=fft)
-            prior.normalize()
-            prior_prob_true = prior.prob.real
-            prior_prob_estimated = prior.prob.real
-
-            diff_hef_filter = BayesFilter(distribution=SE2, prior=prior, device=device)
-            
-            true_hef_filter = BayesFilter(distribution=SE2, prior=prior, device=device)
-            
-            analytic_hef_filter = BayesFilter(distribution=SE2, prior=prior, device=device)
-
-            ekf_filter = RangeEKF(inputs[:, 0], cov_prior_batch)
-
-            hist_filter = BatchedRangeHF(args.batch_size, inputs[:,0],cov_prior_batch, poses, X, Y, T,grid_size=args.grid_size, device=device)
-
-            pf_filter = RangePF(inputs[:, 0],cov_prior_batch, poses.shape[1], args.batch_size, args.grid_size, device=device)
-            
-            trajectory_list = []
-            trajectory_list_true = []
-            trajectory_list_estimated = []
-            trajectory_list_ekf = []
-            trajectory_list_hist = []
-            trajectory_list_pf =[]
-
-            
-            sample_index = random.randint(0, args.batch_size-1)
-            for i in range(args.trajectory_length-1):  # Iterate over trajectory length
-                traj_idx = i + 1
-                # posterior, measurement_model, belief_hat, predicted_pose, nll_measurement_likelihood, nll_posterior = diff_hef_step(inputs[:, traj_idx], measurements[:, traj_idx], control[:, traj_idx], poses, X, Y, T, grid_size, diff_hef_filter, model, fft, hed_r1, MOTION_NOISE, args.batch_size)
-                
-                # a filter here for analytic with true noise 
-                range_beacon = beacons[beacon_idx[:, i], :]
-
-                posterior_true, measurement_model_true, belief_hat_true, predicted_pose_true, nll_measurement_likelihood_true, nll_posterior_true = analytic_hef(
-                    inputs[:, traj_idx], measurements[:, i], range_beacon, control[:, i], poses, X, Y, T, args.grid_size, args.batch_size, true_hef_filter, hed_r1, fft, MOTION_NOISE, TRUE_MEASUREMENT_NOISE)
-
-
-                # # a filter here for analytic with estimated noise 
-                # posterior_estimated, measurement_model_estimated, belief_hat_estimated, motion_model_estimated,  predicted_pose_estimated, nll_measurement_likelihood_estimated, nll_posterior_estimated = analytic_hef(
-                #     inputs[:, traj_idx], measurements[:, i], range_beacon, control[:, i], poses, X, Y, T, args.grid_size, args.batch_size, analytic_hef_filter, hed_r1, fft, MOTION_NOISE, ESTIMATED_MEASUREMENT_NOISE)
-                
-                posterior_mean_hist, posterior_pdf_hist, nll_posterior_hist = range_hist_step(
-                    inputs[:, traj_idx], measurements[:, i], control[:, i], range_beacon, 
-                    hist_filter, MOTION_NOISE=MOTION_NOISE, MEASUREMENT_NOISE=TRUE_MEASUREMENT_NOISE)
-
-                trajectory_list_hist.append(posterior_mean_hist)
-                total_nll_posterior_hist += float(nll_posterior_hist.item())
-
-                posterior_mean_ekf, posterior_cov_ekf, nll_posterior_ekf = range_ekf_step(
-                    inputs[:, traj_idx], measurements[:, i], control[:, i], range_beacon, 
-                    ekf_filter, poses , MOTION_NOISE=MOTION_NOISE, MEASUREMENT_NOISE=TRUE_MEASUREMENT_NOISE)
-
-                trajectory_list_ekf.append(posterior_mean_ekf)
-                total_nll_posterior_ekf += float(nll_posterior_ekf.item())
-
-                posterior_mean_pf, posterior_pf, nll_posterior_pf = range_pf_step(inputs[:, traj_idx], measurements[:, i], control[:, i], range_beacon,
-                    pf_filter, MOTION_NOISE=MOTION_NOISE, MEASUREMENT_NOISE=TRUE_MEASUREMENT_NOISE)
-
-                trajectory_list_pf.append(posterior_mean_pf)
-                total_nll_posterior_pf += float(nll_posterior_pf.item())
-
-                # trajectory_list.append(predicted_pose)
-                # total_nll_likelihood += float(nll_measurement_likelihood.item())
-                # total_nll_posterior += float(nll_posterior.item())
-
-                trajectory_list_true.append(predicted_pose_true)
-                total_nll_likelihood_true += float(nll_measurement_likelihood_true.item())
-                total_nll_posterior_true += float(nll_posterior_true.item())
-
-                # trajectory_list_estimated.append(predicted_pose_estimated)
-                # total_nll_likelihood_estimated += float(nll_measurement_likelihood_estimated.item())
-                # total_nll_posterior_estimated += float(nll_posterior_estimated.item())
-
-
-                
-                if batch_idx == sample_batch:
-                    
-                    pose_dict = {
-                        "GT": inputs[sample_index, traj_idx],
-                        # "Diff-HEF": predicted_pose[sample_index],
-                        "HEF": predicted_pose_true[sample_index],
-                        # "Estimated-HEF": predicted_pose_estimated[sample_index],
-                        "EKF": posterior_mean_ekf[sample_index],
-                        "HistF": posterior_mean_hist[sample_index], 
-                        "PF": posterior_mean_pf[sample_index]
-
-                    }
-
-                    filters_dict = {
-                        "GT": [inputs[sample_index, traj_idx].cpu().numpy(), None],
-                        "HEF": [predicted_pose_true[sample_index].cpu().numpy(), posterior_true.prob[sample_index].cpu().numpy()],
-                        # "Estimated-HEF": [predicted_pose_estimated[sample_index], posterior_estimated.prob[sample_index]],
-                        "EKF": [posterior_mean_ekf[sample_index].cpu().numpy(), posterior_cov_ekf[sample_index].cpu().numpy()],
-                        "HistF": [posterior_mean_hist[sample_index].cpu().numpy(), posterior_pdf_hist[sample_index].cpu().numpy()],
-                        "PF": [posterior_mean_pf[sample_index].cpu().numpy(), posterior_pf[sample_index].cpu().numpy()]
-                    }
-                    # visualize_trajectory(
-                    #     pose_dict,
-                    #     posterior.prob, measurement_model.prob, belief_hat.prob,
-                    #     beacons, sample_index, traj_idx, beacon_idx,
-                    #     X, Y, T, legend, CONFIG_MEAN_SE2_LF, logging_path,
-                    #     f"_diff_hef_{batch_idx}_{sample_index}_{traj_idx}"
-                    # )
-
-                    visualize_trajectory(
-                        pose_dict,
-                        posterior_true.prob.real, measurement_model_true.prob.real, belief_hat_true.prob.real,
-                        beacons, sample_index, i, beacon_idx,
-                        X, Y, T, legend, CONFIG_MEAN_SE2_LF, logging_path,
-                        f"_true_hef_{batch_idx}_{sample_index}_{i}"
-                    )
-                    titles = ["HEF", "EKF", "HistF", "PF"]
-                    # Plot the filters
-                    ax_filter = plot_se2_filters(filters_dict,
-                                                X.cpu().numpy(),
-                                                Y.cpu().numpy(),
-                                                T.cpu().numpy(),
-                                                beacons,
-                                                titles,
-                                                config=CONFIG_MEAN_SE2_LF,)
-                    for ax in ax_filter:
-                        ax.set_xlim(-0.5, 0.5)
-                        ax.set_ylim(-0.5, 0.5)
-                        ax.scatter(beacons[beacon_idx[sample_index, i], 0].cpu(), beacons[beacon_idx[sample_index, i], 1].cpu(),
-                            c='y', marker='o', s=80, alpha=0.8, zorder=2)
-
-
-                    plt.savefig(logging_path + f"/se2_filter_landmarks_{batch_idx}_{sample_index}_{i}.png")
-                    plt.close()
-
-                    # visualize_trajectory(
-                    #     pose_dict,
-                    #     posterior_estimated.prob.real, measurement_model_estimated.prob.real, belief_hat_estimated.prob.real,
-                    #     beacons, sample_index, i, beacon_idx,
-                    #     X, Y, T, legend, CONFIG_MEAN_SE2_LF, logging_path,
-                    #     f"_estimated_hef_{batch_idx}_{sample_index}_{traj_idx}"
-                    # )
-
-
-            # predicted_trajectory = torch.stack(trajectory_list, dim=1)
-            predicted_trajectory_ekf = torch.stack(trajectory_list_ekf, dim=1)
-            predicted_trajectory_true = torch.stack(trajectory_list_true, dim=1)
-            # predicted_trajectory_estimated = torch.stack(trajectory_list_estimated, dim=1)
-            predicted_trajectory_hist = torch.stack(trajectory_list_hist, dim=1)
-            predicted_trajectory_pf = torch.stack(trajectory_list_pf, dim=1)
-
-            # total_rmse += rmse_se2(inputs, predicted_trajectory)
-            total_rmse_true += rmse_se2(inputs, predicted_trajectory_true)
-            # total_rmse_estimated += rmse_se2(inputs, predicted_trajectory_estimated)
-            total_rmse_ekf += rmse_se2(inputs, predicted_trajectory_ekf)
-            total_rmse_hist += rmse_se2(inputs, predicted_trajectory_hist)
-            total_rmse_pf += rmse_se2(inputs, predicted_trajectory_pf)
-        
-        num_samples = len(test_loader)
-        trajectory_length_minus_one = args.trajectory_length - 1
-
-        # avg_rmse = total_rmse / num_samples
-        # avg_nll_likelihood = total_nll_likelihood / (num_samples * trajectory_length_minus_one)
-        # avg_nll_posterior = total_nll_posterior / (num_samples * trajectory_length_minus_one)
-
-        avg_rmse_true = total_rmse_true / num_samples
-        avg_nll_likelihood_true = total_nll_likelihood_true / (num_samples * trajectory_length_minus_one)
-        avg_nll_posterior_true = total_nll_posterior_true / (num_samples * trajectory_length_minus_one)
-
-        # avg_rmse_estimated = total_rmse_estimated / num_samples
-        # avg_nll_likelihood_estimated = total_nll_likelihood_estimated / (num_samples * trajectory_length_minus_one)
-        # avg_nll_posterior_estimated = total_nll_posterior_estimated / (num_samples * trajectory_length_minus_one)
-
-        avg_rmse_ekf = total_rmse_ekf / num_samples
-        avg_nll_posterior_ekf = total_nll_posterior_ekf  / (num_samples * trajectory_length_minus_one)
-
-        avg_rmse_hist = total_rmse_hist / num_samples
-        avg_nll_posterior_hist = total_nll_posterior_hist / (num_samples * trajectory_length_minus_one)
-        
-        avg_rmse_pf = total_rmse_pf / num_samples
-        avg_nll_posterior_pf = total_nll_posterior_pf / (num_samples * trajectory_length_minus_one)
-       
-        # print(f"Average RMSE (Diff-HEF): {avg_rmse}")
-        # print(f"Average NLL Likelihood (Diff-HEF): {avg_nll_likelihood}")
-        # print(f"Average NLL Posterior (Diff-HEF): {avg_nll_posterior}")
-        
-        print(f"Average RMSE (True HEF): {avg_rmse_true}")
-        print(f"Average NLL Likelihood (True HEF): {avg_nll_likelihood_true}")
-        print(f"Average NLL Posterior (True HEF): {avg_nll_posterior_true}")
-
-        # print(f"Average RMSE (Estimated HEF): {avg_rmse_estimated}")
-        # print(f"Average NLL Likelihood (Estimated HEF): {avg_nll_likelihood_estimated}")
-        # print(f"Average NLL Posterior (Estimated HEF): {avg_nll_posterior_estimated}")
-
-        print(f"Average RMSE (EKF): {avg_rmse_ekf}")
-        print(f"Average NLL Posterior (EKF): {avg_nll_posterior_ekf}")
-
-        print(f"Average RMSE (HistF): {avg_rmse_hist}")
-        print(f"Average NLL Posterior (HistF): {avg_nll_posterior_hist}")
-
-        print(f"Average RMSE (PF): {avg_rmse_pf}")
-        print(f"Average NLL Posterior (PF): {avg_nll_posterior_pf}")
-
-        # Log results to wandb as a table
-        table = wandb.Table(columns=["Filter", "RMSE", "NLL Likelihood", "NLL Posterior"])
-        table.add_data("True HEF", str(avg_rmse_true), str(avg_nll_likelihood_true), str(avg_nll_posterior_true))
-        table.add_data("EKF", str(avg_rmse_ekf), "N/A", str(avg_nll_posterior_ekf))
-        # table.add_data("Diff-HEF", str(avg_rmse), str(avg_nll_likelihood), str(avg_nll_posterior))
-        # table.add_data("Estimated HEF", str(avg_rmse_estimated), str(avg_nll_likelihood_estimated), str(avg_nll_posterior_estimated))
-        table.add_data("HistF", str(avg_rmse_hist), "N/A", str(avg_nll_posterior_hist))
-        table.add_data("PF", str(avg_rmse_pf), "N/A", str(avg_nll_posterior_pf))
-
-        wandb.log({"Evaluation Metrics": table})
-        # Log plots to wandb
-        for file in os.listdir(logging_path):
-            if file.endswith(".png"):
-                wandb.log({"Plots": wandb.Image(os.path.join(logging_path, file))})
-
-
 def visualize_trajectory(pose_dict,posterior_pdf, measurement_pdf, belief_hat_prob, beacons, sample_index, traj_idx, beacon_idx, X, Y, T, legend, CONFIG_MEAN_SE2_LF, logging_path, name):
     axes_mean = plot_se2_mean_filters(
         [belief_hat_prob[sample_index], measurement_pdf[sample_index], posterior_pdf[sample_index]],
@@ -723,19 +482,20 @@ def parse_args():
     parser.add_argument('--num_trajectories', type=int, default=300, help='Number of trajectories')
     parser.add_argument('--trajectory_length', type=int, default=80, help='Length of each trajectory')
     parser.add_argument('--step_motion', type=parse_list, default=[0.01, 0.00, np.pi / 40], help='Step motion parameters')
-    parser.add_argument('--motion_cov', type=parse_list, default=[0.01, 0.01, 0.01], help='Motion noise parameters')
+    parser.add_argument('--motion_cov', type=parse_list, default=[0.001, 0.001, 0.001], help='Motion noise parameters')
     parser.add_argument('--measurement_cov', type=float, default=0.0001, help='Measurement noise')
     parser.add_argument('--batch_size', type=int, default=30, help='Batch size')
     parser.add_argument('--validation_split', type=float, default=0.12, help='Validation split')
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split')
-    parser.add_argument('--grid_size', type=parse_list, default=[10, 10, 32], help='Grid size')
+    parser.add_argument('--grid_size', type=parse_list, default=[50, 50, 32], help='Grid size')
     parser.add_argument('--cov_prior', type=parse_list, default=[0.1, 0.1, 0.1], help='Covariance prior')
-    parser.add_argument('--seed', type=int, default=4589, help='Random seed')
+    parser.add_argument('--seed', type=int, default=12345, help='Random seed')
     parser.add_argument('--decay_rate', type=float, default=5, help='Decay rate for regularization')
     parser.add_argument('--threshold_warmup', type=int, default=100, help='Threshold for warmup')
-    parser.add_argument('--learning_rate_start', type=float, default=0.0001, help='Initial learning rate')
-    parser.add_argument('--learning_rate_end', type=float, default=0.005, help='Final learning rate')
-    parser.add_argument('--slope_weight', type=float, default=0.9, help='Slope weight for learning rate decay')
+    parser.add_argument('--learning_rate_start', type=float, default=0.005, help='Initial learning rate')
+    parser.add_argument('--learning_rate_end', type=float, default=0.0001, help='Final learning rate')
+    parser.add_argument('--slope_weight', type=float, default=0.5, help='Slope weight for learning rate decay')
+    parser.add_argument('--soft_resample_alpha', type=float, default=0.75, help='Soft resampling alpha for DifferentiablePF')
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -745,8 +505,8 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
-    run = wandb.init(mode="disabled",project="Diff-PF",group="SE2",entity="korra141",
-              tags=["SE2","Training"],
+    run = wandb.init(project="Diff-PF",group="SE2",entity="korra141",
+              tags=["SE2","Training", "NLP+MSE", "Resampling"],
               name="SE2-DiffPF-RangeSimulator-1",
               notes="Diff-PF on SE2 Range Simulator",
               config=args)

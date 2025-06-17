@@ -213,6 +213,7 @@ def training_hist(logging_path, args, model_path=None):
 
             hist_filter = BatchedRangeHF(args.batch_size, inputs[:, 0], cov_prior_batch, poses, X, Y, T, grid_size=args.grid_size, device=device)
             trajectory_list = []
+            trajectory_list.append(inputs[:, 0])  # Append the first input as the initial state
 
             for i in range(args.trajectory_length - 1):
                 traj_idx = i + 1
@@ -224,8 +225,8 @@ def training_hist(logging_path, args, model_path=None):
                 # print(F.mse_loss(posterior_mean, inputs[:, traj_idx]))
                 # if epoch < args.threshold_warmup:
                 # loss = nll_measurement_likelihood.to(torch.float32)
-                # loss = 0.5*(nll_posterior + mse(posterior_mean, inputs[:, traj_idx])).to(torch.float32)
-                loss = nll_posterior.to(torch.float32)
+                loss = 0.5*(nll_posterior + mse(posterior_mean, inputs[:, traj_idx])).to(torch.float32)
+                # loss = nll_posterior.to(torch.float32)
                 #     loss = (regularizer_weight * nll_measurement_likelihood + (1 - regularizer_weight) * F.mse_loss(posterior_mean, inputs[:, traj_idx])).to(torch.float32)
                 # loss = nll_posterior.to(torch.float32)
                 optimizer.zero_grad()
@@ -291,11 +292,11 @@ def parse_args():
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split')
     parser.add_argument('--grid_size', type=parse_list, default=[50, 50, 32], help='Grid size')
     parser.add_argument('--cov_prior', type=parse_list, default=[0.1, 0.1, 0.1], help='Covariance prior')
-    parser.add_argument('--seed', type=int, default=4589, help='Random seed')
+    parser.add_argument('--seed', type=int, default=12345, help='Random seed')
     parser.add_argument('--decay_rate', type=float, default=5, help='Decay rate for regularization')
     parser.add_argument('--threshold_warmup', type=int, default=200, help='Threshold for warmup')
-    parser.add_argument('--learning_rate_start', type=float, default=0.0005, help='Initial learning rate')
-    parser.add_argument('--learning_rate_end', type=float, default=0.0001, help='Final learning rate')
+    parser.add_argument('--learning_rate_start', type=float, default=0.0001, help='Initial learning rate')
+    parser.add_argument('--learning_rate_end', type=float, default=0.0005, help='Final learning rate')
     parser.add_argument('--slope_weight', type=float, default=1, help='Slope weight for learning rate decay')
     return parser.parse_args()
 
@@ -327,5 +328,5 @@ if __name__ == "__main__":
     logging_path = os.path.join(base_path, "logs", run_name, current_datetime + "_" + str(random_number))
     os.makedirs(logging_path, exist_ok=True)
     # model_path = "/home/mila/r/ria.arora/scratch/Diff-HEF/logs/SE2_Range_HistF/20250430_190039_2013/hist_model_epoch_199.pth"
-    model_path = None
+    model_path = "/home/mila/r/ria.arora/scratch/Diff-HEF/logs/SE2_Range_HistF/20250605_125822_7825/hist_model_epoch_99.pth"
     training_hist(logging_path, args, model_path)

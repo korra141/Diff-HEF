@@ -10,8 +10,24 @@ import math
 
 from src.distributions.SE2.distribution_base import HarmonicExponentialDistribution
 # from distributions.SE2.distribution_base import HarmonicExponentialDistribution
+import psutil
+import os
 
+device = torch.device("cpu")
 
+def print_memory_usage(tag=""):
+    process = psutil.Process(os.getpid())
+    memory_in_mb = process.memory_info().rss / (1024 * 1024)  # Convert bytes to MB
+
+    if device.type == 'cuda':
+        allocated = torch.cuda.memory_allocated(device) / 1024 ** 2  # in MB
+        reserved = torch.cuda.memory_reserved(device) / 1024 ** 2
+        max_allocated = torch.cuda.max_memory_allocated(device) / 1024 ** 2
+        max_reserved = torch.cuda.max_memory_reserved(device) / 1024 ** 2
+
+        print(f"[{tag}] CUDA Memory | Allocated: {allocated:.2f} MB | Reserved: {reserved:.2f} MB | Peak Allocated: {max_allocated:.2f} MB | Peak Reserved: {max_reserved:.2f} MB")
+
+    print(f"[{tag}] Memory Usage: {memory_in_mb:.2f} MB")
 class SE2(HarmonicExponentialDistribution, metaclass=ABCMeta):
 
     def __init__(self, **kwargs):
@@ -25,11 +41,11 @@ class SE2(HarmonicExponentialDistribution, metaclass=ABCMeta):
         """
         # Compute energy of samples
         energy = self.compute_energy(self.samples)
-        _, _, _, _, _, self.eta = self.fft.analyze(energy)
+        self.eta = self.fft.analyze(energy)
         # This seems redundant, but as there is a loss of information in FFT analyze due to cartesian to polar
         # interpolation, the normalization constant is computed wrt to the energy synthesize by the eta params and not
         # by the one originally used as input. Therefore, normalizing the "original" energy starts giving bad results
-        self.energy, _, _, _, _, _ = self.fft.synthesize(self.eta)
+        self.energy = self.fft.synthesize(self.eta)
 
     @classmethod
     def product(cls, dist1: Type['SE2'], dist2: Type['SE2']) -> Type['SE2']:
@@ -146,6 +162,123 @@ class SE2(HarmonicExponentialDistribution, metaclass=ABCMeta):
         # pdb.set_trace()
         M = cls.mulT(dist2.M, dist1.M)
         return cls.from_M(M, dist1.fft)
+    
+
+    def mulT_optimized_v1(fh1, fh2):
+        """
+        Vectorized version - eliminates nested loops
+        """
+        assert fh1.shape == fh2.shape
+        
+        batch_size, r, p, q = fh1.shape
+        p0 = p // 2
+        q0 = q // 2
+        a = p0 - q0
+        b = int(p0 + int(torch.ceil(torch.tensor(q / 2.))))
+        
+        # Vectorized batch matrix multiplication
+        # fh1: [batch, r, p, q], fh2: [batch, r, q, p] (transposed)
+        fh2_transposed = fh2.transpose(-2, -1)  # [batch, r, q, p]
+        
+        # Batch matrix multiplication: [batch, r, p, q] @ [batch, r, q, p] -> [batch, r, p, p]
+        prod = torch.matmul(fh1, fh2_transposed)
+        
+        # Slice the result
+        result = prod[:, :, :, a:b]
+        
+        return result
+
+    def mulT_optimized_v2(fh1, fh2):
+        """
+        Memory-efficient version using einsum
+        """
+        assert fh1.shape == fh2.shape
+        
+        batch_size, r, p, q = fh1.shape
+        p0 = p // 2
+        q0 = q // 2
+        a = p0 - q0
+        b = int(p0 + int(torch.ceil(torch.tensor(q / 2.))))
+        
+        # Use einsum for efficient computation
+        # 'brpq,brqk->brpk' where k is the sliced dimension
+        fh2_sliced = fh2[:, :, a:b, :]  # Pre-slice fh2
+        result = torch.einsum('brpq,brkq->brpk', fh1, fh2_sliced)
+        
+        return result
+
+    def mulT_chunked(fh1, fh2, chunk_size=8):
+        """
+        Process in chunks to reduce peak memory usage
+        """
+        assert fh1.shape == fh2.shape
+        
+        batch_size, r, p, q = fh1.shape
+        p0 = p // 2
+        q0 = q // 2
+        a = p0 - q0
+        b = int(p0 + int(torch.ceil(torch.tensor(q / 2.))))
+        
+        results = []
+        
+        # Process batches in chunks
+        for i in range(0, batch_size, chunk_size):
+            end_idx = min(i + chunk_size, batch_size)
+            
+            # Get chunk
+            fh1_chunk = fh1[i:end_idx]
+            fh2_chunk = fh2[i:end_idx]
+            
+            # Vectorized computation for chunk
+            fh2_transposed = fh2_chunk.transpose(-2, -1)
+            prod = torch.matmul(fh1_chunk, fh2_transposed)
+            chunk_result = prod[:, :, :, a:b]
+            
+            results.append(chunk_result)
+        
+        return torch.cat(results, dim=0)
+
+    def mulT_inplace(fh1, fh2):
+        """
+        In-place computation to minimize memory allocation
+        """
+        assert fh1.shape == fh2.shape
+        
+        batch_size, r, p, q = fh1.shape
+        p0 = p // 2
+        q0 = q // 2
+        a = p0 - q0
+        b = int(p0 + int(torch.ceil(torch.tensor(q / 2.))))
+        
+        # Pre-allocate output tensor
+        output_shape = (batch_size, r, p, b - a)
+        fh12 = torch.empty(output_shape, dtype=fh1.dtype, device=fh1.device)
+        
+        # Process each batch to minimize memory usage
+        for batch_idx in range(batch_size):
+            # Compute matrix multiplication for entire batch at once
+            prod = torch.matmul(fh1[batch_idx], fh2[batch_idx].transpose(-2, -1))
+            fh12[batch_idx] = prod[:, a:b]
+        
+        return fh12
+
+    @classmethod
+    def convolve_optimized(cls, dist1, dist2, method='vectorized', chunk_size=10):
+        """
+        Optimized convolution with multiple memory-saving strategies
+        """
+        if method == 'vectorized':
+            M = cls.mulT_optimized_v1(dist2.M, dist1.M)
+        elif method == 'einsum':
+            M = cls.mulT_optimized_v2(dist2.M, dist1.M)
+        elif method == 'chunked':
+            M = cls.mulT_chunked(dist2.M, dist1.M, chunk_size)
+        elif method == 'inplace':
+            M = cls.mulT_inplace(dist2.M, dist1.M)
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        
+        return cls.from_M(M, dist1.fft)
 
     def normalize(self) -> None:
         """
@@ -153,11 +286,18 @@ class SE2(HarmonicExponentialDistribution, metaclass=ABCMeta):
         Ms for SE2 group
         :return: none
         """
-        _, _ = self.compute_moments_lnz(self.eta, update=True)
-        prob = torch.exp(self.energy - self.l_n_z) + 1e-8
-        _, _, _, _, _, self.M = self.fft.analyze(prob)
-        prob, _, _, _, _, _ = self.fft.synthesize(self.M)
+        # print_memory_usage("Before Normalization")
+        l_n_z = self.compute_moments_lnz(self.eta, update=True)
+        # print_memory_usage("After Normalization Constant")
+        prob = torch.exp(self.energy - l_n_z) + 1e-8
+        # print_memory_usage("After Probability Computation")
+        M_tmp = self.fft.analyze(prob)
+        # print_memory_usage("After Ms Computation")
+        prob = self.fft.synthesize(M_tmp)
+        # print_memory_usage("After Ms Synthesis")
         self.prob = torch.where(prob.real > 0, prob.real, 1e-8)
+        self.M = M_tmp
+        # print_memory_usage("After Probability Update")
 
     def compute_eta(self) -> None:
         """
@@ -165,11 +305,11 @@ class SE2(HarmonicExponentialDistribution, metaclass=ABCMeta):
         :return: none
         """
         # Compute energy
-        self.prob, _, _, _, _, _ = self.fft.synthesize(self.M)
+        self.prob = self.fft.synthesize(self.M)
         self.prob = torch.where(self.prob.real > 0, self.prob.real, torch.tensor(1e-8, device=self.prob.device))
         self.energy = torch.log(self.prob)
         # Compute eta
-        _, _, _, _, _, self.eta = self.fft.analyze(self.energy)
+        self.eta = self.fft.analyze(self.energy)
 
     # def compute_moments_lnz(self, eta: torch.Tensor, update: bool = True) -> Tuple[torch.Tensor, float]:
     #     """
@@ -204,21 +344,18 @@ class SE2(HarmonicExponentialDistribution, metaclass=ABCMeta):
         :param update: whether to update the moments of the distribution and log partition constant
         :return: moments and log partition constant
         """
-        energy, _, _, _, _, _ = self.fft.synthesize(eta)
+        energy = self.fft.synthesize(eta)
         minimum = torch.min(torch.abs(energy)).to(energy.device)
-        _, _, _, _, _, unnormalized_moments = self.fft.analyze(torch.exp(energy - minimum))
+        unnormalized_moments = self.fft.analyze(torch.exp(energy - minimum))
         z_0 = 0
         z_1 = unnormalized_moments.shape[2] // 2
         z_2 = unnormalized_moments.shape[3] // 2
         constant = (unnormalized_moments[:, z_0, z_1, z_2] * (math.pi * 2)).to(energy.device)
-        moments = unnormalized_moments / constant.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        moments[:, z_0, z_1, z_2] = constant
+        # moments = unnormalized_moments / constant.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        # moments[:, z_0, z_1, z_2] = constant
         l_n_z = (torch.log(constant) + minimum).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        if update:
-            self.moments = moments
-            self.l_n_z = l_n_z.real
         # Update moments of distribution and constant only when needed
-        return moments, l_n_z.real
+        return l_n_z.real
 
     def compute_energy(self, t: torch.Tensor) -> torch.Tensor:
         """

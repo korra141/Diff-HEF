@@ -2,16 +2,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
+import psutil
+import numpy as np
+
+
+def print_memory_usage(tag=""):
+    process = psutil.Process(os.getpid())
+    memory_in_mb = process.memory_info().rss / (1024 * 1024)  # Convert bytes to MB
+    print(f"[{tag}] Memory Usage: {memory_in_mb:.2f} MB")
 
 class DifferentiablePF:
     def __init__(self,
-                 prior_mu: torch.Tensor,
-                 prior_cov: torch.Tensor,
                  n_particles: int = 100,
                  batch_size: int = 1,
                  grid_size = (100, 100, 36),
                  grid_bounds = (-0.5, 0.5),
                  alpha: float = 0.0,  # Soft resampling parameter
+                 soft_resample_alpha: float = 0.5,  # Soft resampling parameter for differentiable resampling
                  device: str = "cuda" if torch.cuda.is_available() else "cpu"):
         """
         :param prior_mu: Prior pose as a torch tensor of dimension (B, 3) where B is batch size
@@ -25,34 +33,14 @@ class DifferentiablePF:
         self.batch_size = batch_size
         self.device = device
         self.alpha = alpha
+        self.soft_resample_alpha = soft_resample_alpha  # Soft resampling parameter for differentiable resampling
         self.grid_size = grid_size
         self.grid_bounds = grid_bounds
-        
-        # Move tensors to specified device
-        prior_mu = prior_mu.to(device)
-        prior_cov = prior_cov.to(device)
-        
-        # Ensure proper batch dimension
-        if prior_mu.ndim == 1:
-            prior_mu = prior_mu.unsqueeze(0).expand(batch_size, -1)
-        
-        if prior_cov.ndim == 2:
-            prior_cov = prior_cov.unsqueeze(0).expand(batch_size, -1, -1)
-        
-        # Generate particles from prior: (B, N, 3)
-        L = torch.linalg.cholesky(prior_cov)  # (B, 3, 3)
-        noise = torch.randn((batch_size, 3, n_particles), device=device, dtype=torch.float64)  # (B, 3, N)
-        
-        # L @ noise -> (B, 3, N), then transpose and add prior
-        particles_noise = torch.bmm(L, noise)  # (B, 3, N)
-        self.particles = particles_noise.permute(0, 2, 1) + prior_mu.unsqueeze(1)  # (B, N, 3)
-        
         # Initialize weights: (B, N)
-        self.log_weights = torch.ones((batch_size, n_particles), device=device) * (-math.log(n_particles))
         self.mode_index = torch.zeros(batch_size, dtype=torch.long, device=device)
         self.mixture_std = 0.1  # Standard deviation for mixture likelihood
     
-    def prediction(self, step: torch.Tensor, step_cov: torch.Tensor) -> torch.Tensor:
+    def prediction(self, particles, step: torch.Tensor, step_cov: torch.Tensor) -> torch.Tensor:
         """
         Prediction step PF
         :param step: motion step (relative displacement) of dimension (B, 3)
@@ -79,141 +67,320 @@ class DifferentiablePF:
         step_sample[:, :, 2] = (step_sample[:, :, 2] + math.pi) % (2 * math.pi) - math.pi
         
         # Apply step
-        c = torch.cos(self.particles[:, :, 2])  # (B, N)
-        s = torch.sin(self.particles[:, :, 2])  # (B, N)
+        c = torch.cos(particles[:, :, 2])  # (B, N)
+        s = torch.sin(particles[:, :, 2])  # (B, N)
         
         # Create a new tensor instead of in-place operation
-        new_particles = torch.zeros_like(self.particles)
+        new_particles = torch.zeros_like(particles)
         
         # Update positions
-        new_particles[:, :, 0] = self.particles[:, :, 0] + c * step_sample[:, :, 0] - s * step_sample[:, :, 1]
-        new_particles[:, :, 1] = self.particles[:, :, 1] + s * step_sample[:, :, 0] + c * step_sample[:, :, 1]
-        new_particles[:, :, 2] = self.particles[:, :, 2] + step_sample[:, :, 2]
+        new_particles[:, :, 0] = particles[:, :, 0] + c * step_sample[:, :, 0] - s * step_sample[:, :, 1]
+        new_particles[:, :, 1] = particles[:, :, 1] + s * step_sample[:, :, 0] + c * step_sample[:, :, 1]
+        new_particles[:, :, 2] = particles[:, :, 2] + step_sample[:, :, 2]
         
         # Normalize angles
         new_particles[:, :, 2] = (new_particles[:, :, 2] + math.pi) % (2 * math.pi) - math.pi
         
         # Update particles
-        self.particles = new_particles
+        # self.particles = new_particles
         
-        return self.particles
+        return new_particles
     
-    def update_weights(self, observation_likelihood: torch.Tensor) -> torch.Tensor:
+    def update_weights(self, old_log_weights, observation_likelihood: torch.Tensor) -> torch.Tensor:
         """
         Update step for particle weights
         :param observation_likelihood: Log-likelihood for each particle (B, N)
         :return: Updated log weights (B, N)
         """
         # Update weights with the likelihood
-        self.log_weights = self.log_weights + observation_likelihood
+        normalised_likelihood = observation_likelihood - torch.logsumexp(observation_likelihood, dim=1, keepdim=True)
+        log_weights =  old_log_weights + normalised_likelihood 
         
         # Normalize weights in log space
-        log_sum = torch.logsumexp(self.log_weights, dim=1, keepdim=True)
-        self.log_weights = self.log_weights - log_sum
+        log_sum = torch.logsumexp(log_weights, dim=1, keepdim=True)
+        log_weights_ = log_weights - log_sum
         
         # Handle NaNs
-        if torch.isnan(self.log_weights).any():
+        if torch.isnan(log_weights_).any():
             print(f"Warning: Found nan in weights after normalization")
-            self.log_weights = torch.nan_to_num(self.log_weights, nan=-math.log(self._N))
-            log_sum = torch.logsumexp(self.log_weights, dim=1, keepdim=True)
-            self.log_weights = self.log_weights - log_sum
+            log_weights_processed = torch.nan_to_num(log_weights_, nan=-math.log(self._N))
+            log_sum = torch.logsumexp(log_weights_processed, dim=1, keepdim=True)
+            log_weights_ = log_weights_processed - log_sum
+        
+        # self.log_weights = log_weights_  # Update log weights
         
         # Store mode index for each batch
-        weights = torch.exp(self.log_weights)
-        self.mode_index = torch.argmax(weights, dim=1)
+        # self.weights = torch.exp(self.log_weights)
+        # self.mode_index = torch.argmax(self.weights, dim=1)
         
-        return self.log_weights
+        return log_weights_
     
-    def soft_resampling(self) -> None:
-        """
-        Performs differentiable soft resampling of particles
-        """
-        # Convert log weights to probabilities
-        weights = torch.exp(self.log_weights)
+  
+    # def differentiable_resample_windowed(self, particles, weights, temperature=0.1, window=10):
+    #     """
+    #     Differentiable resampling with soft attention over a local window
+    #     around the cumulative distribution. Reduces memory from O(N^2) to O(N*W).
+    #     """
+    #     B, N = self.batch_size, self._N
+    #     device = torch.device("cpu")
+
+    #     weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)  # (B, N)
+    #     weights = weights.to(device)
+    #     particles = particles.to(device)  # Ensure particles are on the correct device
+    #     cdf = torch.cumsum(weights, dim=1)  # (B, N)
+
+    #     # particles = self.particles.to(device)  # (B, N, D)
+
+    #     # Target positions (low-variance style)
+    #     base = torch.linspace(0.0, 1.0, N, device=device).unsqueeze(0).expand(B, -1)  # (B, N)
+
+    #     # Soft weights: (B, N, W)
+    #     # soft_weights = torch.zeros((B, N, window), device=device)
+    #     soft_weight_chunks = []
+
+    #     half_w = window // 2
+
+    #     for offset in range(-half_w, half_w):
+    #         j = torch.arange(N, device=device) + offset
+    #         j_clamped = j.clamp(min=0, max=N-1)  # Wrap or clamp
+
+    #         cdf_slice = torch.gather(cdf, dim=1, index=j_clamped.unsqueeze(0).expand(B, -1))  # (B, N)
+    #         dist = -((base - cdf_slice) ** 2) / temperature  # (B, N)
+    #         soft = torch.softmax(dist, dim=1)  # Soft weights over local region
+
+    #         soft_weight_chunks.append(soft.unsqueeze(-1))  # (B, N, 1)
+    #         # soft_weights[:, :, offset + half_w] = soft
+
+    #     # Normalize soft weights over window
+    #     soft_weights = torch.cat(soft_weight_chunks, dim=-1)  # (B, N, W)
+    #     soft_weights_ = soft_weights / (soft_weights.sum(dim=-1, keepdim=True) + 1e-8)  # Normalize
+
+    #     # soft_weights = soft_weights / (soft_weights.sum(dim=-1, keepdim=True) + 1e-8)  # (B, N, W)
+
+    #     # Gather particles for the local window
+    #     particle_chunks = []
+    #     for offset in range(-half_w, half_w):
+    #         j = torch.arange(N, device=device) + offset
+    #         j = j.clamp(min=0, max=N - 1)
+    #         selected = torch.gather(
+    #             particles, dim=1,
+    #             index=j[None, :, None].expand(B, -1, particles.shape[2])
+    #         )
+    #     particle_chunks.append(selected.unsqueeze(-2))  # (B, N, 1, D)
+
+    #     particles_window = torch.cat(particle_chunks, dim=-2)  # (B, N, W, D)
+    #     # Weighted sum over window
+    #     new_particles = torch.sum(soft_weights_.unsqueeze(-1) * particles_window, dim=-2)  # (B, N, D)
+
+    #     # self.particles = new_particles.to(self.device)  # Move back to original device
+    #     log_weights = torch.log(soft_weights_.mean(dim=-1) + 1e-8).to(self.device)  # (B, N)
+    #     weights = torch.exp(log_weights).to(self.device)  # (B, N)
+
+    #     return new_particles.to(self.device), weights.to(self.device)
+
+    
+    # def differentiable_resample_windowed_optimised(self, particles, weights, temperature=0.1, window=10):
+    #     """
+    #     Optimized differentiable resampling with soft attention over a local window.
+    #     Key optimizations:
+    #     - Vectorized operations instead of loops
+    #     - Single device transfer
+    #     - Reduced memory allocations
+    #     - Eliminated redundant computations
+    #     """
+    #     B, N = self.batch_size, self._N
+    #     device = particles.device  # Use input device instead of forcing CPU
         
-        # Soft resampling - maintains gradient between old and new weights
-        resample_prob = (1 - self.alpha) * weights + self.alpha/self._N
-        new_weights = weights / resample_prob
+    #     # Normalize weights in-place if possible
+    #     weights_sum = weights.sum(dim=1, keepdim=True)
+    #     weights = weights / (weights_sum + 1e-8)
         
-        # Systematic resampling: samples evenly distributed over original particles
-        base_indices = torch.linspace(0.0, 1.0 - 1.0/self._N, self._N, device=self.device)
-        random_offsets = torch.rand(self.batch_size, 1, device=self.device) / self._N
+    #     # Compute CDF
+    #     cdf = torch.cumsum(weights, dim=1)
         
-        # Shape: (batch_size, num_particles)
-        inds = random_offsets + base_indices[None, :]
+    #     # Target positions - create once
+    #     base = torch.linspace(0.0, 1.0, N, device=device).unsqueeze(0).expand(B, -1)
         
-        # Compute cumulative distribution
-        cum_probs = torch.cumsum(resample_prob, dim=1)
+    #     half_w = window // 2
         
-        # Differentiable resampling using soft assignments
-        # This is the key differentiable part - avoids hard indexing
-        selection_weights = torch.zeros(
-            (self.batch_size, self._N, self._N), 
-            device=self.device
+    #     # Pre-compute all offsets and indices vectorized
+    #     offsets = torch.arange(-half_w, half_w, device=device)  # (W,)
+    #     indices = torch.arange(N, device=device).unsqueeze(0) + offsets.unsqueeze(1)  # (W, N)
+    #     indices_clamped = indices.clamp(0, N-1)  # (W, N)
+        
+    #     # Vectorized CDF gathering for all offsets at once
+    #     # Reshape for batch gathering: (B, W, N)
+    #     indices_batch = indices_clamped.unsqueeze(0).expand(B, -1, -1)
+    #     cdf_gathered = torch.gather(cdf.unsqueeze(1).expand(-1, window, -1), 
+    #                             dim=2, index=indices_batch)  # (B, W, N)
+        
+    #     # Vectorized distance computation and softmax
+    #     # base: (B, 1, N), cdf_gathered: (B, W, N)
+    #     base_expanded = base.unsqueeze(1)  # (B, 1, N)
+    #     distances = -((base_expanded - cdf_gathered) ** 2) / temperature  # (B, W, N)
+    #     soft_weights = torch.softmax(distances, dim=1)  # (B, W, N) - softmax over window dim
+        
+    #     # Transpose for easier particle gathering: (B, N, W)
+    #     soft_weights = soft_weights.transpose(1, 2)
+        
+    #     # Vectorized particle gathering
+    #     # particles: (B, N, D), indices_clamped: (W, N)
+    #     D = particles.shape[2]
+    #     particles_expanded = particles.unsqueeze(2).expand(-1, -1, window, -1)  # (B, N, W, D)
+    #     particles_gathered = torch.gather(
+    #         particles_expanded.reshape(B, N * window, D),
+    #         dim=1,
+    #         index=indices_clamped.T.contiguous().view(1, N * window, 1).expand(B, -1, D)
+    #     ).view(B, N, window, D)
+        
+    #     # Weighted sum over window dimension
+    #     new_particles = torch.sum(soft_weights.unsqueeze(-1) * particles_gathered, dim=2)  # (B, N, D)
+        
+    #     # Compute output weights (mean over window)
+    #     output_weights = soft_weights.mean(dim=2)  # (B, N)
+        
+    #     # Move to target device only once at the end
+    #     return new_particles.to(self.device), output_weights.to(self.device)
+
+    def _resample(self,particles, log_weights) -> None:
+        """Resample particles."""
+        # Note the distinction between `M`, the current number of particles, and
+        # `self.num_particles`, the desired number of particles
+        N, M, state_dim = particles.shape
+
+        sample_logits: torch.Tensor
+        uniform_log_weights = log_weights.new_full(
+            (N, self._N), float(-np.log(M, dtype=np.float32))
+        )
+
+        if self.soft_resample_alpha < 1.0:
+            # Soft resampling
+            assert log_weights.shape == (N, M)
+            sample_logits = torch.logsumexp(
+                torch.stack(
+                    [
+                        log_weights + np.log(self.soft_resample_alpha),
+                        uniform_log_weights + np.log(1.0 - self.soft_resample_alpha),
+                    ],
+                    dim=0,
+                ),
+                dim=0,
+            )
+            log_weights = log_weights - sample_logits
+        else:
+            # Standard particle filter re-sampling -- this stops gradients
+            # This is the most naive flavor of resampling, and not the low
+            # variance approach
+            #
+            # Note the distinction between M, the current # of particles,
+            # and self.num_particles, the desired # of particles
+            sample_logits = log_weights
+            log_weights = uniform_log_weights
+
+        assert sample_logits.shape == (N, M)
+        distribution = torch.distributions.Categorical(logits=sample_logits)
+        state_indices = distribution.sample((self._N,)).T
+        assert state_indices.shape == (N, self._N)
+
+        particles = torch.gather(
+            particles,
+            dim=1,
+            index=state_indices[:, :, None].expand((N, self._N, state_dim)),
         )
         
-        # Create a soft assignment matrix where each row represents how much each 
-        # original particle contributes to a new particle
-        for b in range(self.batch_size):
-            for i in range(self._N):
-                # For each target index, compute soft weights for each source particle
-                # This replaces the hard indexing of searchsorted
-                if i == 0:
-                    left_prob = 0.0
-                else:
-                    left_prob = cum_probs[b, i-1]
-                right_prob = cum_probs[b, i]
+        return particles, log_weights
+
+    # def soft_resampling_for(self) -> None:
+    #     """
+    #     Performs differentiable soft resampling of particles
+    #     """
+    #     # Convert log weights to probabilities
+    #     # weights = torch.exp(self.log_weights)
+        
+    #     # Soft resampling - maintains gradient between old and new weights
+    #     resample_prob = (1 - self.alpha) * self.weights + self.alpha/self._N
+    #     new_weights = self.weights / resample_prob
+        
+    #     # Systematic resampling: samples evenly distributed over original particles
+    #     base_indices = torch.linspace(0.0, 1.0 - 1.0/self._N, self._N, device=self.device)
+    #     random_offsets = torch.rand(self.batch_size, 1, device=self.device) / self._N
+        
+    #     # Shape: (batch_size, num_particles)
+    #     inds = random_offsets + base_indices[None, :]
+        
+    #     # Compute cumulative distribution
+    #     cum_probs = torch.cumsum(resample_prob, dim=1)
+        
+    #     # Differentiable resampling using soft assignments
+    #     # This is the key differentiable part - avoids hard indexing
+    #     selection_weights = torch.zeros(
+    #         (self.batch_size, self._N, self._N), 
+    #         device=self.device
+    #     )
+        
+    #     # Create a soft assignment matrix where each row represents how much each 
+    #     # original particle contributes to a new particle
+    #     for b in range(self.batch_size):
+    #         for i in range(self._N):
+    #             # For each target index, compute soft weights for each source particle
+    #             # This replaces the hard indexing of searchsorted
+    #             if i == 0:
+    #                 left_prob = 0.0
+    #             else:
+    #                 left_prob = cum_probs[b, i-1]
+    #             right_prob = cum_probs[b, i]
                 
-                # Compute overlap between each sample's bin and this particle's probability mass
-                for j in range(self._N):
-                    # Define the sample's bin
-                    if j == 0:
-                        bin_left = 0.0
-                    else:
-                        bin_left = inds[b, j-1]
-                    bin_right = inds[b, j]
+    #             # Compute overlap between each sample's bin and this particle's probability mass
+    #             for j in range(self._N):
+    #                 # Define the sample's bin
+    #                 if j == 0:
+    #                     bin_left = 0.0
+    #                 else:
+    #                     bin_left = inds[b, j-1]
+    #                 bin_right = inds[b, j]
                     
-                    # Calculate overlap
-                    overlap_left = torch.max(left_prob, bin_left)
-                    overlap_right = torch.min(right_prob, bin_right)
-                    overlap = torch.clamp(overlap_right - overlap_left, min=0.0)
+    #                 # Calculate overlap
+    #                 overlap_left = torch.max(left_prob, bin_left)
+    #                 overlap_right = torch.min(right_prob, bin_right)
+    #                 overlap = torch.clamp(overlap_right - overlap_left, min=0.0)
                     
-                    # Assign weight proportional to overlap
-                    if right_prob > left_prob:
-                        selection_weights[b, j, i] = overlap / (right_prob - left_prob)
+    #                 # Assign weight proportional to overlap
+    #                 if right_prob > left_prob:
+    #                     selection_weights[b, j, i] = overlap / (right_prob - left_prob)
         
-        # Use the soft assignment matrix to create new particles
-        new_particles = torch.bmm(selection_weights, self.particles)
+    #     # Use the soft assignment matrix to create new particles
+    #     new_particles = torch.bmm(selection_weights, self.particles)
         
-        # And new weights
-        log_new_weights = torch.log(torch.bmm(
-            selection_weights, 
-            new_weights.unsqueeze(-1)
-        ).squeeze(-1))
+    #     # And new weights
+    #     log_new_weights = torch.log(torch.bmm(
+    #         selection_weights, 
+    #         new_weights.unsqueeze(-1)
+    #     ).squeeze(-1))
         
-        # Normalize the new weights
-        log_sum = torch.logsumexp(log_new_weights, dim=1, keepdim=True)
-        log_new_weights = log_new_weights - log_sum
+    #     # Normalize the new weights
+    #     log_sum = torch.logsumexp(log_new_weights, dim=1, keepdim=True)
+    #     log_new_weights = log_new_weights - log_sum
         
-        # Update particles and weights
-        self.particles = new_particles
-        self.log_weights = log_new_weights
+    #     # Update particles and weights
+    #     self.particles = new_particles
+    #     self.log_weights = log_new_weights
+    #     self.weights = torch.exp(self.log_weights)
     
-    def get_state_estimate(self) -> torch.Tensor:
+    def get_state_estimate(self, particles, log_weights) -> torch.Tensor:
         """
         Compute state estimate from particle distribution
         :return: Mean state estimate (B, 3)
         """
         # Convert log weights to probabilities
-        weights = torch.exp(self.log_weights)
+        weights = torch.exp(log_weights + 1e-8)
         
         # Compute weighted mean of particle states
         # For angles, we use circular statistics to handle wrap-around
-        xy_mean = torch.sum(self.particles[:, :, :2] * weights.unsqueeze(-1), dim=1)
+        xy_mean = torch.mean(particles[:, :, :2] * weights.unsqueeze(-1), dim=1)
         
         # For angles, compute circular mean
-        cos_theta = torch.sum(torch.cos(self.particles[:, :, 2]) * weights, dim=1, keepdim=True)
-        sin_theta = torch.sum(torch.sin(self.particles[:, :, 2]) * weights, dim=1, keepdim=True)
+        cos_theta = torch.mean(torch.cos(particles[:, :, 2]) * weights, dim=1, keepdim=True)
+        sin_theta = torch.mean(torch.sin(particles[:, :, 2]) * weights, dim=1, keepdim=True)
         theta_mean = torch.atan2(sin_theta, cos_theta)
         
         # Combine results
@@ -390,7 +557,7 @@ class DifferentiablePF:
         log_uniform = -torch.ones_like(self.log_weights) * math.log(self._N)
         self.log_weights = (1-alpha) * self.log_weights + alpha * log_uniform
 
-    def mixture_likelihood(self, diffs, weights, reduce_mean=False):
+    def mixture_likelihood(self, diffs, log_weights, reduce_mean=False):
         """
         Compute the negative log likelihood of y under a gaussian
         mixture model defined by a set of particles and their weights.
@@ -410,6 +577,7 @@ class DifferentiablePF:
         likelihood : tensor
             the negative log likelihood
         """
+        weights = torch.exp(log_weights + 1e-8)
         dim = diffs.size(-1)
         num = diffs.size(-2)
         

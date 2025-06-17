@@ -15,12 +15,39 @@ import datetime
 import pdb
 from scipy.ndimage import map_coordinates
 import numpy as np
+import psutil
+import os
+import gc
+
+device = torch.device("cpu")
+
+
+def print_memory_usage(tag=""):
+    process = psutil.Process(os.getpid())
+    memory_in_mb = process.memory_info().rss / (1024 * 1024)  # Convert bytes to MB
+
+    if device.type == 'cuda':
+        allocated = torch.cuda.memory_allocated(device) / 1024 ** 2  # in MB
+        reserved = torch.cuda.memory_reserved(device) / 1024 ** 2
+        max_allocated = torch.cuda.max_memory_allocated(device) / 1024 ** 2
+        max_reserved = torch.cuda.max_memory_reserved(device) / 1024 ** 2
+
+        print(f"[{tag}] CUDA Memory | Allocated: {allocated:.2f} MB | Reserved: {reserved:.2f} MB | Peak Allocated: {max_allocated:.2f} MB | Peak Reserved: {max_reserved:.2f} MB")
+
+    print(f"[{tag}] Memory Usage: {memory_in_mb:.2f} MB")
 
 def preprocess_input_with_cval(input, cval=float('nan')):
     N, C, H, W = input.shape
     extended = torch.full((N, C, H + 2, W + 2), cval, dtype=torch.float64, device=input.device)
     extended[:, :, 1:-1, 1:-1] = input
     return extended
+
+def clear_input(input_tensor):
+    if not input_tensor.requires_grad:
+        del input_tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
 
 def quadratic_bspline_kernel(x):
@@ -36,23 +63,13 @@ def quadratic_bspline_kernel(x):
     )
     return result
 
+@torch.compile(fullgraph=False)
 def spline2d_interpolate(input, grid):
-    """
-    Approximates 2D order-2 (quadratic) B-spline interpolation using `grid_sample`.
-
-    Args:
-        input: (B, C, H, W) tensor.
-        grid: (B, H_out, W_out, 2) sampling grid in [-1, 1] coordinates.
-        padding_mode: 'zeros', 'border', or 'reflection'.
-
-    Returns:
-        Interpolated tensor of shape (B, C, H_out, W_out)
-    """
     B, H, W = input.shape
     device = input.device
 
-    wrapped_coords_x =  grid[1, ...] % input.shape[2]
-    wrapped_coords_y = grid[0, ...] % input.shape[1]
+    wrapped_coords_x = grid[1, ...] % W
+    wrapped_coords_y = grid[0, ...] % H
 
     grid_x = wrapped_coords_x[..., 0] + 1
     grid_y = wrapped_coords_y[..., 1] + 1
@@ -68,17 +85,21 @@ def spline2d_interpolate(input, grid):
 
     for oy in offsets:
         for ox in offsets:
-
             sampled = bilinear_interpolate_torch_circular_padded(input, wrapped_coords_x, wrapped_coords_y)
 
-            # Compute weights using quadratic B-spline
             wy = quadratic_bspline_kernel(dy - oy)
             wx = quadratic_bspline_kernel(dx - ox)
-            w = (wy * wx) # (B,  H_out, W_out)
+            w = wy * wx
 
             out += sampled * w
 
     return out
+
+def clear_memory():
+    """Clear GPU memory cache"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
 
 def adjust_grid_for_extension(grid):
@@ -89,13 +110,13 @@ def adjust_grid_for_extension(grid):
     return adjusted_grid
 @torch.compile(fullgraph=False)
 def map_coordinates_torch_circular_bilinear(input_tensor, coords):
-    with torch.set_grad_enabled(input_tensor.requires_grad):  # Explicitly handle grad mode
-        wrapped_coords_x = coords[1, ...] % input_tensor.shape[2]
-        wrapped_coords_y = coords[0, ...] % input_tensor.shape[1]
-        # wrapped_coords_x = coords[0, ...] % input_tensor.shape[1]
-        # wrapped_coords_y = coords[1, ...] % input_tensor.shape[2]
-        sampled = bilinear_interpolate_torch_circular_padded(input_tensor, wrapped_coords_x, wrapped_coords_y)
-        return sampled
+    # with torch.set_grad_enabled(input_tensor.requires_grad):  # Explicitly handle grad mode
+    # with torch.set_grad_enabled(torch.is_grad_enabled()):
+    H, W = input_tensor.shape[-2:]
+    wrapped_coords_x = coords[1, ...] % W
+    wrapped_coords_y = coords[0, ...] % H
+    sampled = bilinear_interpolate_torch_circular_padded(input_tensor, wrapped_coords_x, wrapped_coords_y)
+    return sampled
     
 # @torch.compile(fullgraph=False)
 # def map_coordinates_torch_circular_spline_order(input_tensor, coords, spline_order):
@@ -133,20 +154,24 @@ def map_coordinates_np(input_tensor, coords, spline_order):
     return sampled
     
 @torch.compile(fullgraph=False)
+# @torch.no_grad()
 def map_coordinates_torch_constant(input_tensor, coords):
-     with torch.set_grad_enabled(input_tensor.requires_grad):
-        fa = torch.empty((input_tensor.shape[0], input_tensor.shape[1] + 1, input_tensor.shape[2] + 1), dtype=torch.float64, device=input_tensor.device)
-        fa[:, :-1, :-1] = input_tensor
-        fa[:, -1, :-1] = input_tensor[:, 0, :]
-        fa[:, :-1, -1] = input_tensor[:, :, 0]
-        fa[:, -1, -1] = input_tensor[:, 0, 0]
-        # wrapped_coords_x = coords[1, ...] % input_tensor.shape[2]
-        # wrapped_coords_y = coords[0, ...] % input_tensor.shape[1]
-        wrapped_coords_x = coords[0, ...] % input_tensor.shape[1]
-        wrapped_coords_y = coords[1, ...] % input_tensor.shape[2]
-        fa_padded = torch.nn.functional.pad(fa, (1, 1, 1, 1), mode='constant', value=float('nan'))
-        sampled = bilinear_interpolate_torch_with_nan(fa_padded, wrapped_coords_x, wrapped_coords_y)
-        return sampled
+    #  with torch.set_grad_enabled(input_tensor.requires_grad):
+    # fa = torch.empty((input_tensor.shape[0], input_tensor.shape[1] + 1, input_tensor.shape[2] + 1), dtype=torch.float64, device=input_tensor.device)
+    # fa[:, :-1, :-1] = input_tensor
+    # fa[:, -1, :-1] = input_tensor[:, 0, :]
+    # fa[:, :-1, -1] = input_tensor[:, :, 0]
+    # fa[:, -1, -1] = input_tensor[:, 0, 0]
+    fa_right = torch.cat([input_tensor, input_tensor[:, :, 0:1]], dim=2)
+    fa_bottom = torch.cat([fa_right, fa_right[:, 0:1, :]], dim=1)
+    fa_padded = torch.nn.functional.pad(fa_bottom, (1, 1, 1, 1), mode='constant', value=float('nan'))
+    # wrapped_coords_x = coords[1, ...] % input_tensor.shape[2]
+    # wrapped_coords_y = coords[0, ...] % input_tensor.shape[1]
+    wrapped_coords_x = coords[0, ...] % input_tensor.shape[1]
+    wrapped_coords_y = coords[1, ...] % input_tensor.shape[2]
+    # fa_padded = torch.nn.functional.pad(fa, (1, 1, 1, 1), mode='constant', value=float('nan'))
+    sampled = bilinear_interpolate_torch_with_nan(fa_padded, wrapped_coords_x, wrapped_coords_y)
+    return sampled
 
 def map_coordinates_np_costant(input_tensor, coords):
 
@@ -203,6 +228,8 @@ class SE2_FFT():
         self.spatial_grid_size = spatial_grid_size
         self.interpolation_method = interpolation_method
         self.device = device
+        self.chunk_size = 4
+        self.use_mixed_precision = False
 
         if interpolation_method == "spline":
             self.spline_order = spline_order
@@ -241,27 +268,67 @@ class SE2_FFT():
             raise ValueError("Unknown interpolation method:" + str(interpolation_method))
 
     def analyze(self, f):
+        torch.cuda.empty_cache()
+        gc.collect()
+        # print_memory_usage("Before Analyze")
         f1c = shift_fft(f).to(self.device)
-        f1p = self.resample_c2p_3d(f1c)
+        clear_input(f)
+        # print_memory_usage("After Shift FFT")
+        # f1p = self.resample_c2p_3d(f1c)
+        f1p = self.resample_c2p_3d_chunked(f1c)
+        clear_input(f1c)
+        # print_memory_usage("After Resample C2P")
         f2 = T1FFT.analyze(f1p.conj(), axis=3).conj()
+        clear_input(f1p)
+        # print_memory_usage("After theta Analyze")
         m_min = -math.floor(f2.shape[3] / 2.0)
         m_max = math.ceil(f2.shape[3] / 2.0) - 1
         varphi = torch.linspace(0, 2 * torch.pi, f2.shape[2] + 1, dtype=torch.float64, device=self.device)[:-1]
         factor = torch.exp(-1j * varphi[None, :, None] * torch.arange(m_min, m_max + 1, dtype=torch.float64, device=self.device)[None, None, :]).unsqueeze(0)
         f2f = f2 * factor
+        clear_input(f2)
+        clear_input(factor)
+        # print_memory_usage("After Factor Multiplication")
         f_hat = T1FFT.analyze(f2f.conj(), axis=2).conj()
-        return f, f1c, f1p, f2, f2f, f_hat
+        clear_input(f2f)
+        # print_memory_usage("After phi Analyze")
+        return f_hat
 
     def synthesize(self, f_hat):
         f2f = T1FFT.synthesize(f_hat.conj(), axis=2).conj()
+        clear_input(f_hat)
         m_min = -math.floor(f2f.shape[3] / 2.0)
         m_max = math.ceil(f2f.shape[3] / 2.0) - 1
         psi = torch.linspace(0, 2 * torch.pi, f2f.shape[2] + 1, dtype=torch.float64, device=self.device)[:-1]
         factor = torch.exp(1j * psi[:, None] * torch.arange(m_min, m_max + 1, dtype=torch.float64, device=self.device)[None, :])
         f2 = f2f * factor[None, None, ...]
+        clear_input(f2f)
+        clear_input(factor)
         f1p = T1FFT.synthesize(f2.conj(), axis=3).conj().to(self.device)
-        f1c = self.resample_p2c_3d(f1p)
+        clear_input(f2)
+        f1c = self.resample_p2c_3d_chunked(f1p)
+        clear_input(f1p)
         f = shift_ifft(f1c)
+        clear_input(f1c)
+        # .permute(0, 2, 1, 3)
+        return f
+    
+    def synthesize_(self, f_hat):
+        f2f = T1FFT.synthesize(f_hat.conj(), axis=2).conj()
+        clear_input(f_hat)
+        m_min = -math.floor(f2f.shape[3] / 2.0)
+        m_max = math.ceil(f2f.shape[3] / 2.0) - 1
+        psi = torch.linspace(0, 2 * torch.pi, f2f.shape[2] + 1, dtype=torch.float64, device=self.device)[:-1]
+        factor = torch.exp(1j * psi[:, None] * torch.arange(m_min, m_max + 1, dtype=torch.float64, device=self.device)[None, :])
+        f2 = f2f * factor[None, None, ...]
+        clear_input(f2f)
+        clear_input(factor)
+        f1p = T1FFT.synthesize(f2.conj(), axis=3).conj().to(self.device)
+        clear_input(f2)
+        f1c = self.resample_p2c_3d_chunked(f1p)
+        clear_input(f1p)
+        f = shift_ifft(f1c)
+        clear_input(f1c)
         # .permute(0, 2, 1, 3)
         return f, f1c, f1p, f2, f2f, f_hat
 
@@ -269,6 +336,8 @@ class SE2_FFT():
         fp_r = map_coordinates_torch_constant(fc.real, self.c2p_coords)
         fp_c = map_coordinates_torch_constant(fc.imag, self.c2p_coords)
         fp = fp_r + 1j * fp_c
+        del  fp_r, fp_c  # Free memory
+        torch.cuda.empty_cache()
         return fp
 
     def resample_p2c(self, fp):
@@ -282,15 +351,66 @@ class SE2_FFT():
             raise NotImplementedError(f"spline_order {self.spline_order} is not supported. Only orders 1 and 2 are implemented.")
 
         fc = fc_r + 1j * fc_c
+        del  fc_r, fc_c  # Free memory
+        torch.cuda.empty_cache()
         return fc 
 
     def resample_c2p_3d(self, fc):
         if self.interpolation_method == 'spline':
-            fp = [self.resample_c2p(fc[:, :, :, i]) for i in range(fc.shape[3])]
-            return torch.stack(fp, dim=-1)
+            fp = torch.empty([fc.shape[0],*self.c2p_coords.shape[1:], fc.shape[-1]], dtype=torch.cdouble)  # Or appropriate dtype
+            print(f"fp shape {fp.shape}")
+            for i in range(fc.shape[3]):
+                fp[:, :, :, i] = self.resample_c2p(fc[:, :, :, i])
+            return fp
+            # fp = [self.resample_c2p(fc[:, :, :, i]) for i in range(fc.shape[3])]
+            # return torch.stack(fp, dim=-1)
         elif self.interpolation_method == 'Fourier':
             fp = [self.flerp.forward(fc[:, :, i]) for i in range(fc.shape[2])]
             return torch.stack(fp, dim=-1)
+        
+    # @torch.no_grad()
+    def resample_c2p_3d_chunked(self, fc):
+        """Process frequency components in chunks to reduce memory usage"""
+        if self.interpolation_method != 'spline':
+            return super().resample_c2p_3d(fc)
+            
+        batch_size, h, w, n_freq = fc.shape
+        target_shape = [batch_size, *self.c2p_coords.shape[1:], n_freq]
+        
+        # Pre-allocate output tensor
+        fp = torch.empty(target_shape, dtype=torch.cdouble, device=self.device)
+        
+        # Process in chunks
+        for i in range(0, n_freq, self.chunk_size):
+            end_idx = min(i + self.chunk_size, n_freq)
+            
+            # Process chunk
+            for j in range(i, end_idx):
+                fp[:, :, :, j] = self.resample_c2p(fc[:, :, :, j])
+            
+            # Clear intermediate tensors
+            clear_memory()
+            
+        return fp
+
+    def resample_p2c_3d_chunked(self, fp):
+        """Process polar frequency components in chunks to reduce memory usage"""
+        if self.interpolation_method != 'spline':
+            return super().resample_p2c_3d(fp)
+
+        batch_size, h, w, n_freq = fp.shape
+        target_shape = [batch_size, *self.spatial_grid_size]
+
+        fc = torch.empty(target_shape, dtype=torch.cdouble, device=self.device)
+
+        for i in range(0, n_freq, self.chunk_size):
+            end_idx = min(i + self.chunk_size, n_freq)
+            for j in range(i, end_idx):
+                fc[:, :, :, j] = self.resample_p2c(fp[:, :, :, j])
+            clear_memory()
+
+        return fc
+        
 
     def resample_p2c_3d(self, fp):
         if self.interpolation_method == 'spline':
@@ -302,17 +422,17 @@ class SE2_FFT():
 
     def neg_log_likelihood(self, energy, pose: torch.Tensor) -> torch.Tensor:
         l_n_z, _ = self.compute_moments_lnz(energy)
-        _, _, _, _, _, eta = self.analyze(energy)
+        eta = self.analyze(energy)
         b_x, b_y, b_t = self.spatial_grid_size
         if pose.ndim < 2:
             pose = rearrange(pose, "b -> 1 b")
         dx, dy = rearrange(pose[:, 0] + 0.5, "b -> b 1 1").to(self.device), rearrange(pose[:, 1] + 0.5, "b -> b 1 1").to(self.device)
         d_theta = rearrange(pose[:, 2] + torch.pi, "b -> b 1 1 1 1").to(self.device)
-        _, _, _, f_p_psi_m, _, _ = self.synthesize(eta)
+        _, _, _, f_p_psi_m, _, _ = self.synthesize_(eta)
         f_p_psi_m = rearrange(torch.fft.ifftshift(f_p_psi_m, dim=2), "b p n m -> b p n m 1")
         omega_n = rearrange(torch.arange(b_t, dtype=torch.float64, device=self.device), "n -> 1 1 1 n 1")
         f_p_psi = torch.sum(f_p_psi_m.conj() * torch.exp(1j * omega_n * d_theta), dim=3).conj()
-        f_p_p = self.resample_p2c_3d(f_p_psi)
+        f_p_p = self.resample_p2c_3d_chunked(f_p_psi)
         f_p_p = torch.fft.ifftshift(f_p_p, dim=(1, 2, 3))
         t_x, t_y = 1, 1
         angle_x = (
@@ -329,7 +449,7 @@ class SE2_FFT():
 
     def compute_moments_lnz(self, energy):
         minimum = torch.min(torch.abs(energy)).to(self.device)
-        _, _, _, _, _, unnormalized_moments = self.analyze(torch.exp(energy - minimum))
+        unnormalized_moments = self.analyze(torch.exp(energy - minimum))
         z_0 = 0
         z_1 = unnormalized_moments.shape[2] // 2
         z_2 = unnormalized_moments.shape[3] // 2

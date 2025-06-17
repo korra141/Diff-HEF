@@ -15,6 +15,7 @@ class SE2Group:
     theta = (theta + np.pi) % (2 * np.pi) - np.pi
     return SE2Group(x, y, theta)
   def parameters(self):
+    self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
     return np.array([self.x, self.y, self.theta])
   @classmethod
   def from_parameters(cls, x, y, theta):
@@ -41,9 +42,9 @@ class SE2SimpleSimulator:
     self.position = self.position + self.step
     noisy_prediction = self.step.parameters() + np.random.randn(3) * self.motion_noise
     # noisy_prediction[2] = (noisy_prediction[2] + np.pi) % (2*np.pi) - np.pi
-    noisy_prediction[2] = (noisy_prediction[2]) % (2*np.pi)
+    # noisy_prediction[2] = (noisy_prediction[2]) % (2*np.pi)
     # self.position.theta = (self.position.theta + np.pi) % (2*np.pi) - np.pi
-    self.position.theta = self.position.theta  % (2*np.pi)
+    # self.position.theta = self.position.theta  % (2*np.pi)
     return self.position.parameters() , noisy_prediction
 
   def measurement(self):

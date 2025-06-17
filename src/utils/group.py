@@ -14,6 +14,7 @@ class SE2Group:
         return SE2Group(x, y, theta)
 
     def parameters(self):
+        self.theta = (self.theta + torch.pi) % (2 * torch.pi) - torch.pi
         return torch.stack([self.x, self.y, self.theta], dim=-1)
 
     @classmethod

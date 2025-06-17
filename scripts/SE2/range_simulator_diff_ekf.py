@@ -70,8 +70,8 @@ def range_ekf_step(inputs, measurements, control, range_beacon, ekf_filter, pose
     measurement_cov = torch.diag(torch.tensor(MEASUREMENT_NOISE ** 2).unsqueeze(0)).to(torch.float64).to(device)
     batch_size = inputs.shape[0]
     measurement_cov_ = torch.tile(measurement_cov.unsqueeze(0), [batch_size , 1,  1])
-    _, _ = ekf_filter.prediction(control, motion_model_cov_)
-    q = landmarks - pose[:, :, 0:2]
+    predicted_pose , predicted_cov = ekf_filter.prediction(control, motion_model_cov_)
+    q = landmarks.squeeze(1) - predicted_pose[:, 0:2]
     z_hat = torch.sqrt(q[:, 0] ** 2 + q[:, 1] ** 2)
     # Construct measurement Jacobian
     jacobian_h = torch.zeros((len(z_hat), 1, 3), dtype=torch.float64, device=landmarks.device)
@@ -79,7 +79,7 @@ def range_ekf_step(inputs, measurements, control, range_beacon, ekf_filter, pose
     jacobian_h[:, :, 0] = (-q[:, 0] / z_hat).unsqueeze(1)
     jacobian_h[:, : , 1] = (-q[:, 1] / z_hat).unsqueeze(1)
     
-    posterior_mean, posterior_cov = ekf_filter.update(range_beacon.squeeze(1), measurements, z_hat.unsqueeze(-1) , jacobian_h, measurement_cov_)
+    posterior_mean, posterior_cov = ekf_filter.update(measurements, z_hat.unsqueeze(-1) , jacobian_h, measurement_cov_)
     nll_posterior = ekf_filter.neg_log_likelihood(inputs, posterior_mean, posterior_cov)
     return posterior_mean, posterior_cov, nll_posterior
 
@@ -255,7 +255,7 @@ def training_ekf(loggin_path, args, model_path):
         epoch_start = 0
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate_start)
     torch.autograd.set_detect_anomaly(True)
-    lr_decay = lambda epoch : (args.learning_rate_end / args.learning_rate_start) ** ((epoch / args.num_epochs) * args.slope_weight)
+    lr_decay = lambda epoch : (args.learning_rate_end / args.learning_rate_start) ** ((epoch / args.num_epochs) ** args.slope_weight)
     for epoch in range(epoch_start, args.num_epochs):
         model.train()
         total_loss = 0
@@ -276,6 +276,7 @@ def training_ekf(loggin_path, args, model_path):
             inputs, measurements, control, range_beacon = inputs.to(device), measurements.to(device), control.to(device), range_beacon.to(device)
             ekf_filter = RangeEKF(inputs[:, 0], cov_prior_batch)
             trajectory_list = []
+            trajectory_list.append(inputs[:, 0])
 
             for i in range(args.trajectory_length - 1):
                 traj_idx = i + 1
@@ -285,8 +286,8 @@ def training_ekf(loggin_path, args, model_path):
                 
                 # if epoch < args.threshold_warmup:
                 # loss = (regularizer_weight_warmup * torch.mean(torch.abs(predicted_measurement - measurements[:,i])) + (1-regularizer_weight_warmup) * nll_measurement_likelihood).to(torch.float32)
-                # loss = 0.5*(nll_posterior.to(torch.float32) + mse(posterior_mean, inputs[:, traj_idx]).to(torch.float32))
-                loss = nll_posterior.to(torch.float32)
+                loss = 0.5*(nll_posterior.to(torch.float32) + mse(posterior_mean, inputs[:, traj_idx]).to(torch.float32))
+                # loss = nll_posterior.to(torch.float32)
 
                 #     loss = (regularizer_weight * nll_measurement_likelihood + (1 - regularizer_weight) * F.mse_loss(posterior_mean ,inputs[:, traj_idx])).to(torch.float32)
                 optimizer.zero_grad()
@@ -339,6 +340,7 @@ def validate_ekf(model, epoch, val_loader, poses, X, Y, T, args):
 
             ekf_filter = RangeEKF(inputs[:, 0], cov_prior_batch)
             trajectory_list = []
+            trajectory_list.append(inputs[:, 0])  # Append the initial state
 
             for i in range(args.trajectory_length - 1):
                 traj_idx = i + 1
@@ -392,12 +394,12 @@ def parse_args():
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split')
     parser.add_argument('--grid_size', type=parse_list, default=[50, 50, 32], help='Grid size')
     parser.add_argument('--cov_prior', type=parse_list, default=[0.1, 0.1, 0.1], help='Covariance prior')
-    parser.add_argument('--seed', type=int, default=4589, help='Random seed')
+    parser.add_argument('--seed', type=int, default=12345, help='Random seed')
     parser.add_argument('--decay_rate', type=float, default=5, help='Decay rate for regularization')
     parser.add_argument('--threshold_warmup', type=int, default=200, help='Threshold for warmup')
     parser.add_argument('--learning_rate_start', type=float, default=0.001, help='Initial learning rate')
     parser.add_argument('--learning_rate_end', type=float, default=0.0001, help='Final learning rate')
-    parser.add_argument('--slope_weight', type=float, default=1, help='Slope weight for learning rate decay')
+    parser.add_argument('--slope_weight', type=float, default=0.5, help='Slope weight for learning rate decay')
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -413,7 +415,7 @@ if __name__ == "__main__":
     #           notes="Diff-HEF on SE2 Range Simulator",
     #           config=args)
     run = wandb.init(project="Diff-EKF",group="SE2",entity="korra141",
-              tags=["SE2", "NLLPosterior","ModelwithMeanBelief"],
+              tags=["SE2", "NLLPosterior+MSE","ModelwithMeanBelief"],
               name="SE2-DiffEKF-RangeSimulator-1",
               notes="Diff-EKF on SE2 Range Simulator",
               config=args)
